@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GLM-5.2 DSA / MLA 技术附录</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --text: #1a1a1a;
+      --muted: #555;
+      --border: #ddd;
+      --code-bg: #f6f8fa;
+      --link: #0969da;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+      line-height: 1.65;
+      color: var(--text);
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 3rem;
+      font-size: 15px;
+    }
+    h1 { font-size: 1.85rem; border-bottom: 2px solid var(--border); padding-bottom: .4rem; }
+    h2 { font-size: 1.35rem; margin-top: 2rem; border-bottom: 1px solid var(--border); padding-bottom: .25rem; }
+    h3 { font-size: 1.1rem; margin-top: 1.5rem; }
+    blockquote {
+      margin: 1rem 0;
+      padding: .5rem 1rem;
+      border-left: 4px solid #ccc;
+      color: var(--muted);
+      background: #fafafa;
+    }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1rem 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: .45rem .65rem;
+      text-align: left;
+    }
+    th { background: #f0f0f0; }
+    pre:not(.mermaid) {
+      background: var(--code-bg);
+      padding: .85rem 1rem;
+      overflow-x: auto;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .9em;
+    }
+    p > code, li > code, td > code {
+      background: var(--code-bg);
+      padding: .1rem .35rem;
+      border-radius: 4px;
+    }
+    .mermaid {
+      margin: 1.25rem 0;
+      text-align: center;
+      overflow-x: auto;
+    }
+    hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+    @media print {
+      body { max-width: none; padding: 1rem; font-size: 12px; }
+      .mermaid { page-break-inside: avoid; }
+      h2 { page-break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+<h1>GLM-5.2 DSA / MLA 技术附录</h1>
+<blockquote>
+<p><strong>主文</strong>：<a href="./GLM-5.2-技术汇报.md">GLM-5.2-技术汇报.md</a><br />
+<strong>代码入口</strong>：<code>nemo_automodel/components/models/glm_moe_dsa/layers.py</code></p>
+</blockquote>
+<hr />
+<h2>1. MLA 基础资料</h2>
+<p>建议有相关的基础(<strong>MHA-&gt;MLA</strong>)</p>
+<p>如果对 MLA 本身不熟，建议先看这两篇，再继续看后面的矩阵流水；如果已经理解 DeepSeek MLA，可以直接跳过。</p>
+<table>
+<thead>
+<tr>
+<th>资料</th>
+<th>链接</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>了解 MLA：MLA</td>
+<td><a href="https://zhuanlan.zhihu.com/p/19585986234">https://zhuanlan.zhihu.com/p/19585986234</a></td>
+</tr>
+<tr>
+<td>MLA 计算流全图解 &amp; 吸收矩阵对比分析</td>
+<td><a href="https://zhuanlan.zhihu.com/p/1954817905456808453">https://zhuanlan.zhihu.com/p/1954817905456808453</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. 读图方式</h2>
+<ul>
+<li><strong>节点</strong>：算子名 → <code>in → out</code> shape → 示例数值（B=1, S=4096）</li>
+<li><strong>箭头文字</strong>：这一步做什么 + 维度怎么变</li>
+<li><strong>线条颜色</strong>：蓝=Block，黄=Q 下投影，橙=Indexer，绿=MLA，紫=Attention</li>
+<li><code>GlmMoeDsaMLA.forward()</code> 收到的 <code>x</code> 已是 <code>input_layernorm(h)</code>；完整 Block 还包括 attention residual、<code>post_attention_layernorm</code>、MLP/MoE residual。</li>
+</ul>
+<p>一句话版：</p>
+<pre><code class="language-text">Indexer 负责选 key 位置，MLA 负责在这些位置上做低秩 attention。
+两者共享 q_resid 起点，但 Indexer 的 K 和 MLA 的 KV 是两条不同支路。
+</code></pre>
+<hr />
+<h2>3. 完整数据流图</h2>
+<pre class="mermaid">flowchart TB
+    subgraph BLOCKIN[Block 输入]
+        HRAW[① block hidden h&lt;br/&gt;in/out: B x S x h_dim&lt;br/&gt;例 1 x 4096 x 6144]
+        HRAW --&gt;|6144维 上一层输出| LNIN[② input_layernorm&lt;br/&gt;in/out: 1 x 4096 x 6144&lt;br/&gt;RMSNorm 稳定每 token 尺度]
+        LNIN --&gt;|6144→6144 归一化后不变| H0[③ x 送入 Attention&lt;br/&gt;in/out: 1 x 4096 x 6144&lt;br/&gt;GlmMoeDsaMLA 入口]
+    end
+
+    subgraph QDOWN[Q 下投影 两条路共用]
+        H0 --&gt;|6144→2048 把 hidden 压到 Q 低秩| QA[④ q_a_proj + q_a_layernorm&lt;br/&gt;in 6144 → out 2048&lt;br/&gt;例 1 x 4096 x 2048]
+        QA --&gt;|2048→2048 RMSNorm| QR[⑤ q_resid 共用残差&lt;br/&gt;in/out: 1 x 4096 x 2048&lt;br/&gt;Indexer 与 MLA 分叉点]
+    end
+
+    subgraph IDX[Indexer 支路 只产 topk_indices]
+        QR --&gt;|2048→32x128=4096 扩成 Indexer Q| WQB[⑥ wq_b 线性&lt;br/&gt;in 2048 → out 4096 flat&lt;br/&gt;再 view 成 32 x 128]
+        WQB --&gt;|4096→32x128 reshape| QIS[⑦ split + Indexer RoPE&lt;br/&gt;in 128 → 64 rope + 64 nope&lt;br/&gt;Indexer 布局 rope 在前]
+        QIS --&gt;|128→128 加位置信息| QI[⑧ Q_index&lt;br/&gt;out: 1 x 4096 x 32 x 128&lt;br/&gt;32 head 各 128 维]
+        H0 --&gt;|6144→128 从 x 算共享 K| WK[⑨ wk + LayerNorm&lt;br/&gt;in 6144 → out 128&lt;br/&gt;所有 idx head 共用一条 K]
+        WK --&gt;|128→128 LN + split| KIS[⑩ split + Indexer RoPE&lt;br/&gt;64 rope + 64 nope]
+        KIS --&gt;|128→128| KI[⑪ K_index&lt;br/&gt;out: 1 x 4096 x 128&lt;br/&gt;每个 key 位置 128 维]
+        H0 --&gt;|6144→32 学每个 head 权重| WH[⑫ weights_proj&lt;br/&gt;out: 1 x 4096 x 32]
+        QI --&gt;|matmul Q K转置&lt;br/&gt;4096 query 对 4096 key| MAT[⑬ per-head scores&lt;br/&gt;out: 1 x 4096 x 32 x 4096]
+        KI --&gt;|K 广播到 32 head| MAT
+        WH --&gt;|32 维 head 权重| WSUM[⑭ ReLU + 加权求和&lt;br/&gt;32 x 4096 → 4096 x 4096&lt;br/&gt;合成最终打分矩阵]
+        MAT --&gt;|ReLU 激活后加权| WSUM
+        WSUM --&gt;|4096x4096→4096x4096| CAU[⑮ mask&lt;br/&gt;padding 置 finfo.min&lt;br/&gt;causal: 只看 j 小于等于 i]
+        CAU --&gt;|每行取 top-k| TK[⑯ topk&lt;br/&gt;out: 1 x 4096 x 2048&lt;br/&gt;每 query 2048 个 key 下标]
+        TK --&gt;|整数索引 非向量| TOPK[⑰ topk_indices&lt;br/&gt;out: 1 x 4096 x 2048 int&lt;br/&gt;内容是 key 位置 j]
+    end
+
+    subgraph MLA[MLA 主支路]
+        QR --&gt;|2048→64x256=16384 扩成 MLA Q| QBP[⑱ q_b_proj&lt;br/&gt;in 2048 → out 16384&lt;br/&gt;view 成 64 head x 256]
+        QBP --&gt;|256→192 nope + 64 pe| QS[⑲ split + MLA RoPE&lt;br/&gt;MLA 布局 nope 在前]
+        QS --&gt;|192+64→256| QD[⑳ Q_dense&lt;br/&gt;out: 1 x 4096 x 64 x 256&lt;br/&gt;dense/SDPA 路径用]
+        H0 --&gt;|6144→512+64 压 KV 到 latent| KVA[㉑ kv_a_proj_with_mqa&lt;br/&gt;out: 1 x 4096 x 576&lt;br/&gt;512 kv + 64 k_pe]
+        KVA --&gt;|576→512+64 split| KVS[㉒ split kv 与 k_pe]
+        KVS --&gt;|512→512 RMSNorm| CKV[㉓ kv latent&lt;br/&gt;out: 1 x 4096 x 512&lt;br/&gt;低秩 KV 表示]
+        KVS --&gt;|64→64 RoPE| KPE[㉔ k_pe 带位置&lt;br/&gt;out: 1 x 4096 x 64]
+        CKV --&gt;|512→64x448 dense 上投影| KVB[㉕ kv_b_proj&lt;br/&gt;out 64 x 192 K + 64 x 256 V]
+        KVB --&gt;|448→192+256 split| DKV[㉖ split k_nope 与 v]
+        DKV --&gt;|192+64→256 拼 K| KD[㉗ K_dense&lt;br/&gt;out: 1 x 4096 x 64 x 256]
+        KPE --&gt;|64 维 broadcast 到 64 head| KD
+        DKV --&gt;|256 维 value| VD[㉘ V_dense&lt;br/&gt;out: 1 x 4096 x 64 x 256]
+        QS --&gt;|192→512 吸收 W_kc 仅 TileLang| QABS[㉙ q_nope absorb&lt;br/&gt;q_abs = q_nope x W_kc&lt;br/&gt;192→512 per head]
+        QABS --&gt;|512+64→576 latent Q| QTL[㉚ Q_latent THD&lt;br/&gt;out: 4096 x 64 x 576&lt;br/&gt;TileLang 路径用]
+        CKV --&gt;|512+64→576 拼 latent| KVLAT[㉛ KV_latent THD&lt;br/&gt;out: 4096 x 1 x 576&lt;br/&gt;不先展开全量 K/V]
+        KPE --&gt;|64 维并入 latent| KVLAT
+    end
+
+    subgraph ATTN[Attention 计算]
+        TOPK --&gt;|2048 个位置→S x S mask| SDPA[㉜ SDPA/TE dense&lt;br/&gt;非 topk 填 finfo.min&lt;br/&gt;仍算全 S 但大部分被 mask]
+        QD --&gt;|Q 1x4096x64x256| SDPA
+        KD --&gt;|K 1x4096x64x256| SDPA
+        VD --&gt;|V 1x4096x64x256| SDPA
+        TOPK --&gt;|只 gather 2048 个 latent 位| TL[㉝ TileLang sparse MLA&lt;br/&gt;O 约 S x k 而非 S x S]
+        QTL --&gt;|4096x64x576| TL
+        KVLAT --&gt;|4096x1x576| TL
+        SDPA --&gt;|64x256 per head 输出| OAT[㉞ attn_out&lt;br/&gt;dense: 1 x 4096 x 64 x 256&lt;br/&gt;tilelang: 4096 x 64 x 256]
+        TL --&gt;|W_vc 还原 v 维| OAT
+    end
+
+    OAT --&gt;|16384→6144 合并 head| OP[㉟ o_proj&lt;br/&gt;in 64x256 → out 6144&lt;br/&gt;head 维拍平后线性]
+    OP --&gt;|6144→6144| ATTOUT[㊱ attention 输出&lt;br/&gt;out: 1 x 4096 x 6144&lt;br/&gt;与 block hidden 同维]
+
+    subgraph BLOCKOUT[Block 输出]
+        HRAW --&gt;|6144 skip 直连| ADD1[㊲ residual add&lt;br/&gt;in h 6144 + attn 6144&lt;br/&gt;out: 1 x 4096 x 6144]
+        ATTOUT --&gt;|6144 加回主路径| ADD1
+        ADD1 --&gt;|6144→6144| LNPOST[㊳ post_attention_layernorm&lt;br/&gt;in/out: 1 x 4096 x 6144]
+        LNPOST --&gt;|dense: 6144→12288→6144&lt;br/&gt;MoE expert: 6144→2048→6144| FFN[㊴ MLP 或 MoE&lt;br/&gt;前 3 层 dense MLP&lt;br/&gt;其余层 MoE: 256 routed + 1 shared, top-8&lt;br/&gt;out 仍 6144]
+        FFN --&gt;|6144 FFN 输出| ADD2[㊵ block output&lt;br/&gt;in/out: 1 x 4096 x 6144&lt;br/&gt;送下一层 Block]
+        ADD1 --&gt;|第二个残差支路| ADD2
+    end
+
+    linkStyle 0,1,45,47,48,49,50 stroke:#1565C0,stroke-width:2.5px
+    linkStyle 2,3 stroke:#F9A825,stroke-width:2.5px
+    linkStyle 4,5,6,7,8,9,10,11,12,13,14,15,16,17 stroke:#EF6C00,stroke-width:2.5px
+    linkStyle 18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33 stroke:#2E7D32,stroke-width:2.5px
+    linkStyle 34,35,36,37,38,39,40,41,42,43,44,46 stroke:#7B1FA2,stroke-width:2.5px</pre>
+<hr />
+<h2>4. 按颜色读主线</h2>
+<table>
+<thead>
+<tr>
+<th>颜色</th>
+<th>起点</th>
+<th>维度变化链</th>
+<th>最终产出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>蓝</td>
+<td><code>h</code> skip + <code>attn_out</code></td>
+<td><code>6144 + 6144 → 6144</code>（残差）→ dense MLP / MoE → 再残差</td>
+<td>下一层 Block 输入</td>
+</tr>
+<tr>
+<td>黄</td>
+<td><code>x</code></td>
+<td><code>6144 → 2048</code>（q_a）→ <code>2048</code>（q_resid）</td>
+<td>供 Indexer / MLA 共用的 Q 低秩表示</td>
+</tr>
+<tr>
+<td>橙</td>
+<td><code>x</code> + <code>q_resid</code></td>
+<td><code>6144 → 128</code>（K_index）+ <code>2048 → 32×128</code>（Q_index）→ 打分 <code>4096×4096</code> → topk</td>
+<td><code>topk_indices [1,4096,2048]</code> 整数位置</td>
+</tr>
+<tr>
+<td>绿</td>
+<td><code>x</code> + <code>q_resid</code></td>
+<td><code>6144 → 512+64</code>（KV 压缩）+ <code>2048 → 64×256</code>（Q_mla）→ dense 展开 K/V 或 TileLang latent</td>
+<td><code>Q/K/V</code> 或 <code>Q_latent/KV_latent</code></td>
+</tr>
+<tr>
+<td>紫</td>
+<td><code>topk_indices</code> + MLA 输出</td>
+<td>topk → mask / gather → <code>64×256</code> head 输出 → <code>16384 → 6144</code></td>
+<td><code>attn_out [1,4096,6144]</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Indexer vs MLA 的 Q 别混</strong>：同源 <code>q_resid [1,4096,2048]</code>，但 Indexer 走 <code>wq_b → 32×128</code>，MLA 走 <code>q_b_proj → 64×256</code>；Indexer 的 K 来自 <code>wk(x)</code> 而非 MLA 的 K。</p>
+<hr />
+<h2>5. 关键维度</h2>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>参数</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入</td>
+<td>hidden_size</td>
+<td>6144</td>
+</tr>
+<tr>
+<td>Q 低秩</td>
+<td>q_lora_rank</td>
+<td>2048</td>
+</tr>
+<tr>
+<td>KV 低秩</td>
+<td>kv_lora_rank</td>
+<td>512</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>num_attention_heads</td>
+<td>64</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>qk_nope_head_dim</td>
+<td>192</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>qk_rope_head_dim</td>
+<td>64</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>qk_head_dim</td>
+<td>256</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>v_head_dim</td>
+<td>256</td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td>index_n_heads</td>
+<td>32</td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td>index_head_dim</td>
+<td>128</td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td>index_topk</td>
+<td>2048</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>HF config 中有 <code>head_dim=192</code> 字段；画 MLA 主路时应以 <code>qk_head_dim=256 = 192 + 64</code> 为准。</p>
+</blockquote>
+<hr />
+<h2>6. 分支解释</h2>
+<h3>6.1 Indexer 支路</h3>
+<pre><code class="language-text">q_resid [B,S,2048]
+  → wq_b
+  → Q_index [B,S,32,128]
+
+x [B,S,6144]
+  → wk + LayerNorm
+  → K_index [B,S,128]
+
+Q_index @ K_index^T
+  → scores [B,S,S]
+  → topk_indices [B,S,2048]
+</code></pre>
+<p><code>topk_indices</code> 是整数位置编号，表示每个 query 可以看的 key 位置集合。</p>
+<h3>6.2 MLA 支路</h3>
+<pre><code class="language-text">q_resid [B,S,2048]
+  → q_b_proj
+  → Q_mla [B,S,64,256]
+
+x [B,S,6144]
+  → kv_a_proj_with_mqa
+  → kv_latent [B,S,512] + k_pe [B,S,64]
+</code></pre>
+<p>Dense 路径会通过 <code>kv_b_proj</code> 展开完整 <code>K/V</code>；TileLang 路径会在 latent 空间按 topk 做 sparse MLA。</p>
+<hr />
+<h2>7. Dense / SDPA 与 TileLang 路径</h2>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>计算方式</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dense / SDPA</td>
+<td>展开 <code>K_dense/V_dense</code>，用 topk mask 屏蔽非选中位置</td>
+<td>smoke、短序列、排障</td>
+</tr>
+<tr>
+<td>TileLang sparse MLA</td>
+<td><code>q_nope</code> 吸收到 latent 维度，直接 gather selected latent</td>
+<td>长上下文、正式 recipe</td>
+</tr>
+</tbody>
+</table>
+<p>TileLang 关键形态：</p>
+<pre><code class="language-text">q_nope [T,64,192]
+  → absorb W_kc
+  → q_absorbed [T,64,512]
+  → concat q_pe [64]
+  → Q_latent [T,64,576]
+
+kv_latent [T,512] + k_pe [T,64]
+  → KV_latent [T,1,576]
+</code></pre>
+<hr />
+<h2>8. 代码对应</h2>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>代码位置 / 名称</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block</td>
+<td><code>nemo_automodel/components/models/glm_moe_dsa/model.py::Block</code></td>
+</tr>
+<tr>
+<td>Attention</td>
+<td><code>GlmMoeDsaMLA</code></td>
+</tr>
+<tr>
+<td>Indexer</td>
+<td><code>GlmMoeDsaIndexer</code></td>
+</tr>
+<tr>
+<td>Q 低秩支路</td>
+<td><code>q_a_proj</code>、<code>q_a_layernorm</code>、<code>q_b_proj</code></td>
+</tr>
+<tr>
+<td>KV latent 支路</td>
+<td><code>kv_a_proj_with_mqa</code>、<code>kv_a_layernorm</code>、<code>kv_b_proj</code></td>
+</tr>
+<tr>
+<td>Dense sparse mask</td>
+<td><code>_build_sparse_mask</code></td>
+</tr>
+<tr>
+<td>TileLang sparse MLA</td>
+<td><code>tilelang_sparse_attention</code></td>
+</tr>
+<tr>
+<td>IndexShare</td>
+<td><code>indexer_types</code>、<code>skip_topk</code>、<code>prev_topk_indices</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. 容易讲错的点</h2>
+<table>
+<thead>
+<tr>
+<th>误区</th>
+<th>正确口径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>topk=2048</code> 是选 2048 个维度</td>
+<td>是选 2048 个 key 位置</td>
+</tr>
+<tr>
+<td>DSA 替代 attention</td>
+<td>DSA 只选位置，MLA 才做 attention</td>
+</tr>
+<tr>
+<td>Indexer K 就是 MLA K</td>
+<td>两条支路，投影不同</td>
+</tr>
+<tr>
+<td>Indexer head 数应等于 MLA head 数</td>
+<td>Indexer 是 32 heads，MLA 是 64 heads</td>
+</tr>
+<tr>
+<td><code>head_dim=192</code> 就是 MLA QK head</td>
+<td>MLA 主路应看 <code>qk_head_dim=256</code></td>
+</tr>
+</tbody>
+</table>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "default",
+    flowchart: { useMaxWidth: true, htmlLabels: true },
+    securityLevel: "loose"
+  });
+</script>
+</body>
+</html>

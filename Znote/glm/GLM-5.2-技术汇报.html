@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>GLM-5.2-技术汇报.md</title>
+<meta http-equiv="Content-type" content="text/html;charset=UTF-8">
+
+<style>
+/* https://github.com/microsoft/vscode/blob/master/extensions/markdown-language-features/media/markdown.css */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+body {
+	font-family: var(--vscode-markdown-font-family, -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Ubuntu", "Droid Sans", sans-serif);
+	font-size: var(--vscode-markdown-font-size, 14px);
+	padding: 0 26px;
+	line-height: var(--vscode-markdown-line-height, 22px);
+	word-wrap: break-word;
+}
+
+#code-csp-warning {
+	position: fixed;
+	top: 0;
+	right: 0;
+	color: white;
+	margin: 16px;
+	text-align: center;
+	font-size: 12px;
+	font-family: sans-serif;
+	background-color:#444444;
+	cursor: pointer;
+	padding: 6px;
+	box-shadow: 1px 1px 1px rgba(0,0,0,.25);
+}
+
+#code-csp-warning:hover {
+	text-decoration: none;
+	background-color:#007acc;
+	box-shadow: 2px 2px 2px rgba(0,0,0,.25);
+}
+
+body.scrollBeyondLastLine {
+	margin-bottom: calc(100vh - 22px);
+}
+
+body.showEditorSelection .code-line {
+	position: relative;
+}
+
+body.showEditorSelection .code-active-line:before,
+body.showEditorSelection .code-line:hover:before {
+	content: "";
+	display: block;
+	position: absolute;
+	top: 0;
+	left: -12px;
+	height: 100%;
+}
+
+body.showEditorSelection li.code-active-line:before,
+body.showEditorSelection li.code-line:hover:before {
+	left: -30px;
+}
+
+.vscode-light.showEditorSelection .code-active-line:before {
+	border-left: 3px solid rgba(0, 0, 0, 0.15);
+}
+
+.vscode-light.showEditorSelection .code-line:hover:before {
+	border-left: 3px solid rgba(0, 0, 0, 0.40);
+}
+
+.vscode-light.showEditorSelection .code-line .code-line:hover:before {
+	border-left: none;
+}
+
+.vscode-dark.showEditorSelection .code-active-line:before {
+	border-left: 3px solid rgba(255, 255, 255, 0.4);
+}
+
+.vscode-dark.showEditorSelection .code-line:hover:before {
+	border-left: 3px solid rgba(255, 255, 255, 0.60);
+}
+
+.vscode-dark.showEditorSelection .code-line .code-line:hover:before {
+	border-left: none;
+}
+
+.vscode-high-contrast.showEditorSelection .code-active-line:before {
+	border-left: 3px solid rgba(255, 160, 0, 0.7);
+}
+
+.vscode-high-contrast.showEditorSelection .code-line:hover:before {
+	border-left: 3px solid rgba(255, 160, 0, 1);
+}
+
+.vscode-high-contrast.showEditorSelection .code-line .code-line:hover:before {
+	border-left: none;
+}
+
+img {
+	max-width: 100%;
+	max-height: 100%;
+}
+
+a {
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}
+
+a:focus,
+input:focus,
+select:focus,
+textarea:focus {
+	outline: 1px solid -webkit-focus-ring-color;
+	outline-offset: -1px;
+}
+
+hr {
+	border: 0;
+	height: 2px;
+	border-bottom: 2px solid;
+}
+
+h1 {
+	padding-bottom: 0.3em;
+	line-height: 1.2;
+	border-bottom-width: 1px;
+	border-bottom-style: solid;
+}
+
+h1, h2, h3 {
+	font-weight: normal;
+}
+
+table {
+	border-collapse: collapse;
+}
+
+table > thead > tr > th {
+	text-align: left;
+	border-bottom: 1px solid;
+}
+
+table > thead > tr > th,
+table > thead > tr > td,
+table > tbody > tr > th,
+table > tbody > tr > td {
+	padding: 5px 10px;
+}
+
+table > tbody > tr + tr > td {
+	border-top: 1px solid;
+}
+
+blockquote {
+	margin: 0 7px 0 5px;
+	padding: 0 16px 0 10px;
+	border-left-width: 5px;
+	border-left-style: solid;
+}
+
+code {
+	font-family: Menlo, Monaco, Consolas, "Droid Sans Mono", "Courier New", monospace, "Droid Sans Fallback";
+	font-size: 1em;
+	line-height: 1.357em;
+}
+
+body.wordWrap pre {
+	white-space: pre-wrap;
+}
+
+pre:not(.hljs),
+pre.hljs code > div {
+	padding: 16px;
+	border-radius: 3px;
+	overflow: auto;
+}
+
+pre code {
+	color: var(--vscode-editor-foreground);
+	tab-size: 4;
+}
+
+/** Theming */
+
+.vscode-light pre {
+	background-color: rgba(220, 220, 220, 0.4);
+}
+
+.vscode-dark pre {
+	background-color: rgba(10, 10, 10, 0.4);
+}
+
+.vscode-high-contrast pre {
+	background-color: rgb(0, 0, 0);
+}
+
+.vscode-high-contrast h1 {
+	border-color: rgb(0, 0, 0);
+}
+
+.vscode-light table > thead > tr > th {
+	border-color: rgba(0, 0, 0, 0.69);
+}
+
+.vscode-dark table > thead > tr > th {
+	border-color: rgba(255, 255, 255, 0.69);
+}
+
+.vscode-light h1,
+.vscode-light hr,
+.vscode-light table > tbody > tr + tr > td {
+	border-color: rgba(0, 0, 0, 0.18);
+}
+
+.vscode-dark h1,
+.vscode-dark hr,
+.vscode-dark table > tbody > tr + tr > td {
+	border-color: rgba(255, 255, 255, 0.18);
+}
+
+</style>
+
+<style>
+/* Tomorrow Theme */
+/* http://jmblog.github.com/color-themes-for-google-code-highlightjs */
+/* Original theme - https://github.com/chriskempson/tomorrow-theme */
+
+/* Tomorrow Comment */
+.hljs-comment,
+.hljs-quote {
+	color: #8e908c;
+}
+
+/* Tomorrow Red */
+.hljs-variable,
+.hljs-template-variable,
+.hljs-tag,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-regexp,
+.hljs-deletion {
+	color: #c82829;
+}
+
+/* Tomorrow Orange */
+.hljs-number,
+.hljs-built_in,
+.hljs-builtin-name,
+.hljs-literal,
+.hljs-type,
+.hljs-params,
+.hljs-meta,
+.hljs-link {
+	color: #f5871f;
+}
+
+/* Tomorrow Yellow */
+.hljs-attribute {
+	color: #eab700;
+}
+
+/* Tomorrow Green */
+.hljs-string,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition {
+	color: #718c00;
+}
+
+/* Tomorrow Blue */
+.hljs-title,
+.hljs-section {
+	color: #4271ae;
+}
+
+/* Tomorrow Purple */
+.hljs-keyword,
+.hljs-selector-tag {
+	color: #8959a8;
+}
+
+.hljs {
+	display: block;
+	overflow-x: auto;
+	color: #4d4d4c;
+	padding: 0.5em;
+}
+
+.hljs-emphasis {
+	font-style: italic;
+}
+
+.hljs-strong {
+	font-weight: bold;
+}
+</style>
+
+<style>
+/*
+ * Markdown PDF CSS
+ */
+
+ body {
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Ubuntu", "Droid Sans", sans-serif, "Meiryo";
+	padding: 0 12px;
+}
+
+pre {
+	background-color: #f8f8f8;
+	border: 1px solid #cccccc;
+	border-radius: 3px;
+	overflow-x: auto;
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+}
+
+pre:not(.hljs) {
+	padding: 23px;
+	line-height: 19px;
+}
+
+blockquote {
+	background: rgba(127, 127, 127, 0.1);
+	border-color: rgba(0, 122, 204, 0.5);
+}
+
+.emoji {
+	height: 1.4em;
+}
+
+code {
+	font-size: 14px;
+	line-height: 19px;
+}
+
+/* for inline code */
+:not(pre):not(.hljs) > code {
+	color: #C9AE75; /* Change the old color so it seems less like an error */
+	font-size: inherit;
+}
+
+/* Page Break : use <div class="page"/> or <div class="page"></div> to insert page break
+-------------------------------------------------------- */
+.page {
+	page-break-after: always;
+}
+
+</style>
+
+<script src="https://unpkg.com/mermaid/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: document.body.classList.contains('vscode-dark') || document.body.classList.contains('vscode-high-contrast')
+          ? 'dark'
+          : 'default'
+    });
+  </script>
+<h1 id="glm-52-技术汇报关键架构与单机验证">GLM-5.2 技术汇报：关键架构与单机验证</h1>
+<blockquote>
+<p><strong>定位</strong>：GLM-5.2 架构与验证策略说明。<br>
+<strong>附录</strong>：<a href="./GLM-5.2-DSA-MLA-%E6%8A%80%E6%9C%AF%E9%99%84%E5%BD%95.md">GLM-5.2-DSA-MLA-技术附录.md</a><br>
+<strong>更新</strong>：2026-07-09</p>
+</blockquote>
+<hr>
+<h2 id="1-核心结论">1. 核心结论</h2>
+<p>GLM-5.2 是约 <strong>355B 参数 MoE 模型</strong>，在 NeMo AutoModel 中对应 <code>GlmMoeDsaForCausalLM</code>。它不是普通的 “标准 Attention + Dense MLP” 结构，核心差异集中在三点：</p>
+<pre class="hljs"><code><div>DSA 决定“看哪些 token”
+MLA 决定“怎么低成本表示 Q/KV”
+MoE 决定“参数规模很大，但每个 token 只激活一小部分”
+</div></code></pre>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型规模</td>
+<td>78 层，hidden_size=6144，约 355B MoE</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>DSA Indexer + MLA，不是标准 MHA</td>
+</tr>
+<tr>
+<td>稀疏选择</td>
+<td>每个 query 从序列位置中选 <code>index_topk=2048</code> 个 key</td>
+</tr>
+<tr>
+<td>FFN</td>
+<td>前 3 层 dense MLP，后 75 层 MoE</td>
+</tr>
+<tr>
+<td>单机 8xH200</td>
+<td>适合减层 smoke，不能代表完整 78 层正式训练</td>
+</tr>
+</tbody>
+</table>
+<p>工程判断：</p>
+<pre class="hljs"><code><div>单机 8xH200 的合理目标是验证“代码路径 + 权重加载 + EP/MoE + loss 有限”，
+不是直接完成完整 GLM-5.2 训练。
+</div></code></pre>
+<hr>
+<h2 id="2-架构定位">2. 架构定位</h2>
+<p>标准 Transformer Block 通常可以简化为：</p>
+<pre class="hljs"><code><div>Attention 看全序列 → Dense MLP 做逐 token 变换
+</div></code></pre>
+<p>GLM-5.2 的 Block 更接近：</p>
+<pre class="hljs"><code><div>DSA 先选 key 位置
+  ↓
+MLA 用低秩 Q/KV 做 sparse attention
+  ↓
+MoE 让 token 只经过少量专家
+</div></code></pre>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>常规做法</th>
+<th>GLM-5.2 做法</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Attention 范围</td>
+<td>每个 token 看全部历史 token</td>
+<td>DSA 先选 top-k key 位置</td>
+<td>降低长上下文 attention 成本</td>
+</tr>
+<tr>
+<td>Q/K/V 表示</td>
+<td>hidden 直接投影到全维 Q/K/V</td>
+<td>MLA 低秩 Q 与 KV latent</td>
+<td>降低 KV 表示和缓存压力</td>
+</tr>
+<tr>
+<td>FFN</td>
+<td>每层一个 dense MLP</td>
+<td>前 3 层 dense，后 75 层 MoE</td>
+<td>扩大参数规模，同时控制激活计算</td>
+</tr>
+<tr>
+<td>长上下文</td>
+<td>受 <code>O(S^2)</code> 限制明显</td>
+<td>sparse + latent + CP/TileLang</td>
+<td>支撑 32K 及更长上下文路线</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="3-关键技术">3. 关键技术</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>一句话说明</th>
+<th>关键数字</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DSA Indexer</td>
+<td>为每个 query 预先选择可看的 key 位置</td>
+<td>32 heads，head_dim=128，topk=2048</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>Q/KV 走低秩表示，再展开或直接 sparse attention</td>
+<td>q_lora=2048，kv_lora=512</td>
+</tr>
+<tr>
+<td>DSA + MLA 协同</td>
+<td>DSA 产位置索引，MLA 在这些位置上做 attention</td>
+<td>MLA heads=64，qk/v head_dim=256</td>
+</tr>
+<tr>
+<td>IndexShare</td>
+<td>部分层复用上一层 topk，减少重复 indexer 成本</td>
+<td>full/shared 层交替</td>
+</tr>
+<tr>
+<td>MoE FFN</td>
+<td>每个 token 只走 top-8 routed experts + shared expert</td>
+<td>256 routed + 1 shared</td>
+</tr>
+<tr>
+<td>长上下文训练</td>
+<td>依赖 sparse attention、latent KV、CP/TileLang</td>
+<td>32K recipe 使用 CP=8</td>
+</tr>
+</tbody>
+</table>
+<h3 id="31-dsa先决定看哪里">3.1 DSA：先决定看哪里</h3>
+<p>DSA 不是 attention 本身，而是一个 <strong>Indexer</strong>。它为每个 query token 选出可 attend 的 key 位置：</p>
+<pre class="hljs"><code><div>hidden x
+  → Indexer 打分
+  → topk_indices [B, S, 2048]
+  → 后续 attention 只看这些 key 位置
+</div></code></pre>
+<p>关键点：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>回答</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>topk 选的是什么</td>
+<td>序列里的 key 位置编号，不是向量维度</td>
+</tr>
+<tr>
+<td>topk 是否筛 Q</td>
+<td>不筛 Q，只限制 K/V 或 KV latent</td>
+</tr>
+<tr>
+<td>Indexer 的 K 是否等于 MLA 的 K</td>
+<td>不是，Indexer 有独立 <code>wk(x)</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="32-mla让-attention-表示更省">3.2 MLA：让 Attention 表示更省</h3>
+<p>MLA 使用低秩结构表示 Q/KV，避免所有路径都直接物化完整 Q/K/V：</p>
+<pre class="hljs"><code><div>Q 路径：
+x [6144] → q_a_proj → q_resid [2048] → q_b_proj → Q [64 × 256]
+
+KV 路径：
+x [6144] → kv_a_proj → kv_latent [512] + k_pe [64]
+</div></code></pre>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>做法</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dense / SDPA</td>
+<td>展开完整 K/V，再使用 topk mask</td>
+<td>短序列 smoke、排障</td>
+</tr>
+<tr>
+<td>TileLang sparse MLA</td>
+<td>不展开全量 K/V，在 <code>512+64=576</code> latent 上 gather topk</td>
+<td>长上下文、正式 recipe</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-moe参数规模与激活计算解耦">3.3 MoE：参数规模与激活计算解耦</h3>
+<p>GLM-5.2 的 FFN 部分是 <strong>前稠后稀</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>层范围</th>
+<th>FFN 类型</th>
+<th>形态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0-2</td>
+<td>Dense MLP</td>
+<td>6144 → 12288 → 6144</td>
+</tr>
+<tr>
+<td>3-77</td>
+<td>MoE</td>
+<td>256 routed experts + 1 shared expert</td>
+</tr>
+</tbody>
+</table>
+<p>MoE 层中，每个 token 的路径是：</p>
+<pre class="hljs"><code><div>router 给 256 个专家打分
+  → 选择 top-8 routed experts
+  → 每个专家内部是 6144 → 2048 → 6144
+  → 再加 shared expert
+</div></code></pre>
+<p>因此，355B 参数规模不等价于每个 token 都计算 355B 参数。</p>
+<hr>
+<h2 id="4-一层-block-的数据流">4. 一层 Block 的数据流</h2>
+<p>一层 Attention 可以简化为三条支路：</p>
+<pre class="hljs"><code><div>输入 x [B,S,6144]
+  │
+  ├─ q_a_proj + RMSNorm
+  │      ↓
+  │   q_resid [B,S,2048]
+  │      ├─ Indexer：wq_b(q_resid) + wk(x) → topk_indices [B,S,2048]
+  │      └─ MLA Q：q_b_proj(q_resid) → Q [B,S,64,256]
+  │
+  ├─ MLA KV：kv_a_proj(x) → kv_latent [B,S,512] + k_pe [B,S,64]
+  │
+  └─ Sparse Attention：只看 topk_indices 指向的 key 位置
+         ↓
+      o_proj → 输出 [B,S,6144]
+</div></code></pre>
+<p>注意三点：</p>
+<ol>
+<li><code>q_resid [2048]</code> 是 Indexer 与 MLA 的共享分叉点。</li>
+<li><code>topk_indices [B,S,2048]</code> 存的是 key 位置编号，不是 hidden 维度。</li>
+<li>Indexer 的 <code>Q/K</code> 与 MLA 的 <code>Q/KV</code> 是两套支路，不能混写。</li>
+</ol>
+<p>完整矩阵流水和 Mermaid 图见：<a href="./GLM-5.2-DSA-MLA-%E6%8A%80%E6%9C%AF%E9%99%84%E5%BD%95.md">GLM-5.2-DSA-MLA-技术附录.md</a>。</p>
+<hr>
+<h2 id="5-单机-h200-验证边界">5. 单机 H200 验证边界</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>单机 8xH200 是否适合</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>减层 smoke</td>
+<td>适合</td>
+<td>6 层 target，验证 pipeline</td>
+</tr>
+<tr>
+<td>完整 78 层 target</td>
+<td>不建议</td>
+<td>MoE expert 权重驻留压力大</td>
+</tr>
+<tr>
+<td>32K TileLang/CP 正式 SFT</td>
+<td>不适合单机</td>
+<td>目标是多节点 recipe</td>
+</tr>
+</tbody>
+</table>
+<p>smoke 验证的是工程链路：</p>
+<pre class="hljs"><code><div>本地 GLM-5.2 checkpoint
+  → FP8 权重 dequant 到 bf16
+  → EP=8 分片 MoE experts
+  → 6 层 target forward
+  → DSpark draft 训练
+  → loss 有限且能跑到 step
+</div></code></pre>
+<p>smoke 不代表：</p>
+<ul>
+<li>不代表完整 78 层能在单机训练。</li>
+<li>不代表 32K TileLang 长上下文已经验证。</li>
+<li>不代表训练出了可用模型。</li>
+</ul>
+<hr>
+<h2 id="6-关键数字速查">6. 关键数字速查</h2>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>参数</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型</td>
+<td>hidden_size</td>
+<td>6144</td>
+</tr>
+<tr>
+<td>模型</td>
+<td>num_hidden_layers</td>
+<td>78</td>
+</tr>
+<tr>
+<td>DSA</td>
+<td>index_n_heads / index_head_dim</td>
+<td>32 / 128</td>
+</tr>
+<tr>
+<td>DSA</td>
+<td>index_topk</td>
+<td>2048</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>q_lora_rank / kv_lora_rank</td>
+<td>2048 / 512</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>attention heads</td>
+<td>64</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>qk_head_dim / v_head_dim</td>
+<td>256 / 256</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>routed / shared experts</td>
+<td>256 / 1</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>num_experts_per_tok</td>
+<td>8</td>
+</tr>
+<tr>
+<td>Dense FFN</td>
+<td>intermediate_size</td>
+<td>12288</td>
+</tr>
+<tr>
+<td>MoE FFN</td>
+<td>moe_intermediate_size</td>
+<td>2048</td>
+</tr>
+<tr>
+<td>长上下文</td>
+<td>max_position_embeddings</td>
+<td>1,048,576</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7-结论与下一步">7. 结论与下一步</h2>
+<p>当前阶段应把 GLM-5.2 工作拆成两层目标：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>目标</th>
+<th>结果判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单机减层 smoke</td>
+<td>跑通 GLM-5.2 target + DSpark draft 的训练链路</td>
+<td>权重加载成功、loss 有限、step 可持续</td>
+</tr>
+<tr>
+<td>多节点正式验证</td>
+<td>跑完整 78 层 target，验证 EP/TileLang/CP 长上下文路径</td>
+<td>target forward 稳定、显存可控、长上下文 recipe 可执行</td>
+</tr>
+</tbody>
+</table>
+<p>优先级建议：</p>
+<ol>
+<li>先固化单机 8xH200 smoke 记录，形成可复现实验基线。</li>
+<li>再准备多节点 EP 配置，验证完整 78 层 target。</li>
+<li>最后推进 32K TileLang sparse MLA / CP 长上下文路线。</li>
+</ol>
+
+</body>
+</html>
