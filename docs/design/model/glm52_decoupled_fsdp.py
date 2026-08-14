@@ -9,6 +9,7 @@
 3. EP、expert-FSDP、dense-FSDP 都从同一个 root DeviceMesh 派生。
 4. 第一版不改变 expert 的 EP/FSDP Shard(0) 布局。
 5. HF load/save 必须根据参数角色选择正确 FSDP mesh。
+6. SFT CLI、Trainer 和 TrainEngine 的公开调用方式保持不变。
 """
 
 from __future__ import annotations
@@ -42,6 +43,17 @@ class ModelConfigPseudo(Protocol):
 
 
 class TrainerConfigPseudo(Protocol):
+    model_cfg: ModelConfigPseudo
+    fsdp_cfg: FSDPConfigPseudo
+    dataloader_cfg: Any
+    optim_cfg: Any
+    lr_cfg: Any
+    load_from: Any
+    load_checkpoint_cfg: Any
+    global_batch_size: int | None
+    intra_layer_micro_batch: int
+    total_step: int | None
+    total_epoch: int | None
     sp_size: int
 
 
@@ -69,6 +81,276 @@ def validate_decoupled_v1(
     assert trainer.sp_size == 1
     assert fsdp.cpu_offload is False
     assert fsdp.torch_compile is False
+
+
+# =============================================================================
+# xtuner/v1/train/cli/sft.py -> Trainer.__init__ -> Trainer.fit 调用链
+# =============================================================================
+
+
+def sft_main_pseudo(trainer_cfg: TrainerConfigPseudo) -> None:
+    """SFT CLI 保持薄入口，不在这里创建 dense/expert mesh。"""
+
+    trainer = TrainerLifecyclePseudo.from_config(trainer_cfg)
+    trainer.fit()
+    existing_destroy_process_group_if_initialized()
+
+
+class TrainEngineLifecyclePseudo:
+    """对应 TrainEngine.__init__ 与 build_model 的现有时序。"""
+
+    def __init__(
+        self,
+        *,
+        model_cfg: ModelConfigPseudo,
+        optim_cfg: Any,
+        fsdp_cfg: FSDPConfigPseudo,
+        intra_layer_micro_batch: int,
+    ) -> None:
+        self.model_cfg = model_cfg
+        self.fsdp_cfg = fsdp_cfg
+
+        # 关键顺序：meta 构造 -> FSDP 包装 -> optimizer。
+        self.model = self.build_model()
+        self.optimizer = existing_build_optimizer(optim_cfg, self.model)
+        self.intra_layer_micro_batch = intra_layer_micro_batch
+
+    def build_model(self) -> Any:
+        model = existing_build_model_on_meta(self.model_cfg)
+
+        # coupled/decoupled 的唯一训练入口仍是 BaseModel.fully_shard。
+        # Trainer 和 TrainEngine 不直接查找或包装 experts。
+        return model.fully_shard(self.fsdp_cfg)
+
+    def from_hf(self, model_path: Any, strict: bool) -> None:
+        self.model.from_hf(hf_path=model_path, strict=strict)
+
+    def init_model_weights(self) -> None:
+        self.model.init_weights()
+
+    def train_step(self, engine_input: Any) -> Any:
+        """保持现有 forward、loss.backward 和 micro-batch 控制流。"""
+
+        return existing_train_step(self.model, engine_input)
+
+    def clip_grad_norm(self) -> Any:
+        # 解耦后唯一相关变化发生在 model.scale_and_reduce_grad() 内部。
+        self.model.scale_and_reduce_grad()
+        return existing_cal_grad_norm(self.model)
+
+    def step_optimizer(self, grad_norm: Any) -> None:
+        existing_step_optimizer(self.optimizer, grad_norm)
+
+    def save_hf(self, output_dir: Any) -> None:
+        # 公开接口不改；model.save_hf 内部按参数角色选择 FSDP mesh。
+        self.model.save_hf(output_dir)
+
+    def save_dcp(self, output_dir: Any) -> None:
+        existing_save_dcp(self.model, self.optimizer, output_dir)
+
+
+class TrainerLifecyclePseudo:
+    """只展示解耦 mesh 相关的 Trainer 初始化和训练主链。"""
+
+    @classmethod
+    def from_config(cls, config: TrainerConfigPseudo) -> TrainerLifecyclePseudo:
+        # 真实 Trainer.from_config 继续逐字段转发；不新增顶层 trainer 参数。
+        return cls(
+            model_cfg=config.model_cfg,
+            fsdp_cfg=config.fsdp_cfg,
+            optim_cfg=config.optim_cfg,
+            dataloader_cfg=config.dataloader_cfg,
+            lr_cfg=config.lr_cfg,
+            load_from=config.load_from,
+            load_checkpoint_cfg=config.load_checkpoint_cfg,
+            sp_size=config.sp_size,
+            global_batch_size=config.global_batch_size,
+            intra_layer_micro_batch=config.intra_layer_micro_batch,
+            total_step=config.total_step,
+            total_epoch=config.total_epoch,
+        )
+
+    def __init__(
+        self,
+        *,
+        model_cfg: ModelConfigPseudo,
+        fsdp_cfg: FSDPConfigPseudo,
+        optim_cfg: Any,
+        dataloader_cfg: Any,
+        lr_cfg: Any,
+        load_from: Any,
+        load_checkpoint_cfg: Any,
+        sp_size: int,
+        global_batch_size: int | None,
+        intra_layer_micro_batch: int,
+        total_step: int | None,
+        total_epoch: int | None,
+    ) -> None:
+        self._init_dist()
+        self._sp_size = sp_size
+        self._fsdp_config = fsdp_cfg
+        self.tokenizer = existing_build_tokenizer()
+
+        # 这是数据使用的 (dp, sp, tp) mesh；不能拿它代替模型的 MoE root mesh。
+        self.data_mesh = self._init_data_mesh(
+            tp_size=fsdp_cfg.tp_size,
+            sp_size=sp_size,
+        )
+        self.sp_mesh = self.data_mesh["sp"]
+
+        # 先执行当前 EP/compile 冲突处理，再校验 decoupled 第一阶段边界。
+        self._resolve_config_conflicts(self.tokenizer, model_cfg, dataloader_cfg, fsdp_cfg)
+        validate_decoupled_v1(fsdp_cfg, model_cfg, self)
+
+        self._dataloader = existing_build_dataloader(
+            dataloader_cfg,
+            data_mesh=self.data_mesh,
+            tokenizer=self.tokenizer,
+            global_batch_size=global_batch_size,
+            total_step=total_step,
+        )
+
+        self._engine = self.build_engine(
+            model_path=load_from,
+            model_cfg=model_cfg,
+            optim_cfg=optim_cfg,
+            fsdp_cfg=fsdp_cfg,
+            load_checkpoint_cfg=load_checkpoint_cfg,
+            intra_layer_micro_batch=intra_layer_micro_batch,
+        )
+        self._lr_scheduler = existing_build_lr_scheduler(
+            lr_cfg,
+            self._engine.optimizer,
+            total_step=total_step,
+            total_epoch=total_epoch,
+        )
+
+        # DCP 恢复必须在 model、optimizer 和 scheduler 都存在后执行。
+        if load_checkpoint_cfg.checkpoint_path is not None:
+            self._load_checkpoint(load_checkpoint_cfg)
+
+        self._setup_existing_hooks_profiler_and_metrics()
+
+    def build_engine(
+        self,
+        *,
+        model_path: Any,
+        model_cfg: ModelConfigPseudo,
+        optim_cfg: Any,
+        fsdp_cfg: FSDPConfigPseudo,
+        load_checkpoint_cfg: Any,
+        intra_layer_micro_batch: int,
+    ) -> TrainEngineLifecyclePseudo:
+        engine = TrainEngineLifecyclePseudo(
+            model_cfg=model_cfg,
+            optim_cfg=optim_cfg,
+            fsdp_cfg=fsdp_cfg,
+            intra_layer_micro_batch=intra_layer_micro_batch,
+        )
+
+        if existing_should_load_hf(model_path, model_cfg, load_checkpoint_cfg):
+            engine.from_hf(model_path, strict=True)
+        elif load_checkpoint_cfg.checkpoint_path is None:
+            engine.init_model_weights()
+        return engine
+
+    def fit(self) -> None:
+        """训练主循环不增加 coupled/decoupled 分支。"""
+
+        for data_batch in self._data_iter():
+            engine_input = self._prepare_model_input(data_batch)
+            train_step_info = self._engine.train_step(engine_input)
+
+            grad_norm = self._engine.clip_grad_norm()
+            self._engine.step_optimizer(grad_norm)
+
+            self._log_step(train_step_info, grad_norm)
+            self._lr_scheduler.step()
+            self._maybe_save_hf()  # 间接进入 mesh-aware model.save_hf
+            self._maybe_save_dcp()  # 继续复用 PyTorch DCP
+            self._maybe_collect_python_gc_every_50_steps()
+
+    def _init_dist(self) -> None: ...
+
+    @property
+    def sp_size(self) -> int:
+        return self._sp_size
+
+    def _init_data_mesh(self, *, tp_size: int, sp_size: int) -> Any: ...
+
+    def _resolve_config_conflicts(
+        self,
+        tokenizer: Any,
+        model_cfg: ModelConfigPseudo,
+        dataloader_cfg: Any,
+        fsdp_cfg: FSDPConfigPseudo,
+    ) -> None: ...
+
+    def _load_checkpoint(self, load_checkpoint_cfg: Any) -> None: ...
+
+    def _setup_existing_hooks_profiler_and_metrics(self) -> None: ...
+
+    def _data_iter(self): ...
+
+    def _prepare_model_input(self, data_batch: Any) -> Any: ...
+
+    def _log_step(self, train_step_info: Any, grad_norm: Any) -> None: ...
+
+    def _maybe_save_hf(self) -> None: ...
+
+    def _maybe_save_dcp(self) -> None: ...
+
+    def _maybe_collect_python_gc_every_50_steps(self) -> None: ...
+
+
+def existing_destroy_process_group_if_initialized() -> None: ...
+
+
+def existing_build_model_on_meta(model_cfg: ModelConfigPseudo) -> Any: ...
+
+
+def existing_build_tokenizer() -> Any: ...
+
+
+def existing_build_optimizer(optim_cfg: Any, model: Any) -> Any: ...
+
+
+def existing_train_step(model: Any, engine_input: Any) -> Any: ...
+
+
+def existing_cal_grad_norm(model: Any) -> Any: ...
+
+
+def existing_step_optimizer(optimizer: Any, grad_norm: Any) -> None: ...
+
+
+def existing_save_dcp(model: Any, optimizer: Any, output_dir: Any) -> None: ...
+
+
+def existing_build_dataloader(
+    dataloader_cfg: Any,
+    *,
+    data_mesh: Any,
+    tokenizer: Any,
+    global_batch_size: int | None,
+    total_step: int | None,
+) -> Any: ...
+
+
+def existing_build_lr_scheduler(
+    lr_cfg: Any,
+    optimizer: Any,
+    *,
+    total_step: int | None,
+    total_epoch: int | None,
+) -> Any: ...
+
+
+def existing_should_load_hf(
+    model_path: Any,
+    model_cfg: ModelConfigPseudo,
+    load_checkpoint_cfg: Any,
+) -> bool: ...
 
 
 # =============================================================================
@@ -244,7 +526,6 @@ def fully_shard_pseudo(
     mp_policy: Any,
     reshard_after_forward: bool,
     offload_policy: Any,
-    shard_placement_fn: Any = None,
 ) -> None: ...
 
 
@@ -291,7 +572,6 @@ def fully_shard_with_ignored(
     reshard_after_forward: bool,
     offload_policy: Any,
     extra_ignored_params: set[Any] | None = None,
-    shard_placement_fn: Any = None,
 ) -> None:
     """对现有 BaseModel._fully_shard 的最小接口扩展。"""
 
@@ -308,7 +588,6 @@ def fully_shard_with_ignored(
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
         offload_policy=offload_policy,
-        shard_placement_fn=shard_placement_fn,
     )
 
 
@@ -431,7 +710,6 @@ class MoEDesignPseudo:
                     reshard_after_forward=self.expert_reshard_after_forward(idx),
                     offload_policy=None,
                     # 第一版不传 AutoModel 的 Shard(1)，保留 XTuner 默认 Shard(0)。
-                    shard_placement_fn=None,
                 )
                 # 必须在 inner FSDP 后重新读取，不能使用 FSDP 前缓存的 parameter id。
                 current_expert_params = set(raw_layer.experts.parameters())
@@ -692,7 +970,7 @@ def existing_hf_generator_for_one_bucket(
 
 
 def save_and_resume_same_topology_with_existing_dcp(engine: Any) -> None:
-    """第一版只承诺相同 decoupled topology 的 DCP 连续性。"""
+    """公开 DCP 接口不变，第一版只定义相同 decoupled topology 的边界。"""
 
     state = engine._get_dcp_state_dict(
         cpu_offload=True,
@@ -702,95 +980,3 @@ def save_and_resume_same_topology_with_existing_dcp(engine: Any) -> None:
     engine.existing_dcp_load_and_set_state(state)
 
     # Trainer 现有逻辑另外恢复 scheduler 与 train_state.json。
-    assert_next_step_matches_uninterrupted_run(engine)
-
-
-def assert_next_step_matches_uninterrupted_run(engine: Any) -> None: ...
-
-
-# =============================================================================
-# tests/model/test_moe_decoupled_fsdp.py
-# =============================================================================
-
-
-def test_ep4_topology() -> None:
-    """8 卡 EP4：dense=8，expert-FSDP=2，EP=4。"""
-
-    meshes = build_test_meshes(world_size=8, ep_size=4, mode="decoupled")
-    assert meshes.dense_fsdp.size() == 8
-    assert meshes.expert_fsdp.size() == 2
-    assert meshes.ep.size() == 4
-
-
-def test_ep2_topology() -> None:
-    """8 卡 EP2：dense=8，expert-FSDP=4，EP=2。"""
-
-    meshes = build_test_meshes(world_size=8, ep_size=2, mode="decoupled")
-    assert meshes.dense_fsdp.size() == 8
-    assert meshes.expert_fsdp.size() == 4
-    assert meshes.ep.size() == 2
-
-
-def test_parameter_ownership_exactly_once(model: Any) -> None:
-    """每个可训练参数恰好由 dense 或 expert FSDP unit 管理一次。"""
-
-    ownership_count = collect_fsdp_ownership_count(model)
-    for _name, count in ownership_count.items():
-        assert count == 1
-
-
-def test_coupled_default_does_not_regress() -> None:
-    """默认配置的 mesh 名、placement、local shape、loss 和 grad 行为不变。"""
-
-    compare_current_and_refactored_coupled_path()
-
-
-def test_one_step_numerical_parity() -> None:
-    """固定 batch 比较 coupled/decoupled 的 loss、grad、delta 和 AdamW state。"""
-
-    coupled = run_fixed_one_step(mode="coupled")
-    decoupled = run_fixed_one_step(mode="decoupled")
-    assert_close_training_state(coupled, decoupled)
-
-
-def test_hf_round_trip_ep2_and_ep4() -> None:
-    """strict load -> train -> sync export -> independent strict reload。"""
-
-    for ep_size in (2, 4):
-        result = run_hf_round_trip(ep_size=ep_size, mode="decoupled")
-        assert result.missing_keys == set()
-        assert result.unexpected_keys == set()
-        assert result.duplicate_keys == set()
-
-
-def test_same_topology_dcp_resume() -> None:
-    """恢复后的下一步与未中断 run 对齐。"""
-
-    uninterrupted, resumed = run_dcp_resume_pair(mode="decoupled", ep_size=4)
-    assert_close_training_state(uninterrupted.next_step, resumed.next_step)
-
-
-def build_test_meshes(
-    *,
-    world_size: int,
-    ep_size: int,
-    mode: Literal["coupled", "decoupled"],
-) -> MoEParallelMeshes: ...
-
-
-def collect_fsdp_ownership_count(model: Any) -> dict[str, int]: ...
-
-
-def compare_current_and_refactored_coupled_path() -> None: ...
-
-
-def run_fixed_one_step(*, mode: str) -> Any: ...
-
-
-def assert_close_training_state(left: Any, right: Any) -> None: ...
-
-
-def run_hf_round_trip(*, ep_size: int, mode: str) -> Any: ...
-
-
-def run_dcp_resume_pair(*, mode: str, ep_size: int) -> tuple[Any, Any]: ...

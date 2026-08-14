@@ -293,7 +293,7 @@ round-trip 与 Triton/CUTLASS 回归。
 - dense 参数在 decoupled 模式沿 flat dense mesh 分片，不再有 EP `Replicate`，不能额外再做一次 EP all-reduce。
 
 `cal_grad_norm()` 已按 `(device_mesh, placements)` 分桶，并沿所有 `Shard` placement 做规约；机制上能够处理
-dense 与 expert 两种布局，但必须通过同 batch 测试证明没有漏算或重复规约。
+dense 与 expert 两种布局，但仍要用同 batch 数值比对确认没有漏算或重复规约。
 
 AdamW 必须在 FSDP 完成后构建。验收时不仅比较 loss，还要比较：
 
@@ -354,7 +354,142 @@ decoupled EP2 -> decoupled EP4
 
 跨模式或跨 EP 恢复优先通过 consolidated HF 权重中转，不能默认 DCP 会自动完成所有重分片。
 
-## 6. 兼容性矩阵
+## 6. SFT 训练入口调用链与接口影响
+
+### 6.1 真实调用链
+
+当前 SFT 入口没有单独构造 mesh。它只负责得到 `TrainerConfig`，然后把训练生命周期交给
+`Trainer.from_config()`、`Trainer.__init__()` 和 `Trainer.fit()`：
+
+```text
+xtuner/v1/train/cli/sft.py::main
+    |
+    +-> Config.fromfile(config)["trainer"]
+    |   或 TrainingArguments.to_trainer_config()
+    |
+    +-> Trainer.from_config(trainer_cfg)
+    |       |
+    |       +-> Trainer.__init__(...)
+    |               |
+    |               +-> _init_dist()
+    |               +-> _init_data_mesh(tp_size, sp_size)
+    |               +-> _resolve_config_conflicts(...)
+    |               +-> dataloader_cfg.build(...)
+    |               +-> build_engine(...)
+    |               |       |
+    |               |       +-> TrainEngine.__init__(...)
+    |               |       |       +-> build_model()
+    |               |       |       |       +-> model_cfg.build() on meta
+    |               |       |       |       +-> model.fully_shard(fsdp_cfg)
+    |               |       |       +-> build_optimizer(model)
+    |               |       |
+    |               |       +-> engine.from_hf(...) 或 init_model_weights()
+    |               |
+    |               +-> build_lr_scheduler(...)
+    |               +-> _load_checkpoint()（配置了 DCP resume 时）
+    |               +-> hooks / profiler / metrics recorder
+    |
+    +-> trainer.fit()
+```
+
+这里有两个不能打乱的时序：
+
+1. `model.fully_shard(fsdp_cfg)` 先完成，再用分片后的参数对象创建 optimizer。
+2. HF 权重在 `TrainEngine` 构造完成后加载；DCP 则在 engine 和 LR scheduler 都构造完成后恢复 model、optimizer、
+   scheduler 和 train state。
+
+因此，解耦 mesh 应继续收口在 `model.fully_shard()` 内部，而不是让 SFT CLI 或 `Trainer` 自己包装 expert。
+
+### 6.2 `Trainer.__init__()` 的影响
+
+`Trainer.__init__()` 负责把配置、数据、模型、optimizer、scheduler 和 checkpoint 串起来，但它不应该理解
+`dense_fsdp_mesh` 与 `expert_fsdp_mesh` 的具体构造细节。
+
+| 调用接口 | 当前职责 | 解耦后的处理 |
+|---|---|---|
+| `TrainerConfig.fsdp_cfg` | 保存 `FSDPConfig` | 自动携带新增的 `moe_fsdp_mesh` 字段，不增加 Trainer 顶层字段 |
+| `Trainer.from_config()` | 把配置字段转交给 `Trainer.__init__()` | 签名和控制流不改 |
+| `Trainer.__init__()` | 初始化训练全部组件 | 公开签名不改，只增加 fail-fast 配置校验 |
+| `_resolve_config_conflicts()` | 对齐 model/FSDP 的 EP、compile 等配置 | 在现有 EP 对齐完成后调用 `validate_decoupled_v1()` |
+| `_init_data_mesh()` | 创建 dataloader 使用的 `(dp, sp, tp)` mesh | 第一阶段不改；它不是模型参数的 dense/expert FSDP mesh |
+| `Trainer.build_engine()` | 创建 engine，再决定 HF load 或随机初始化 | 签名不改 |
+| `TrainEngine.__init__()` | 构造 model 和 optimizer | 签名不改，继续把 `fsdp_cfg` 传给 model |
+| `TrainEngine.build_model()` | meta 构造后调用 `model.fully_shard()` | 调用方式不改，由 `MoE.fully_shard()` 内部选择 coupled/decoupled |
+| `OptimConfig.build(model)` | 为 FSDP 后的参数创建 optimizer | 不改，且必须保持在 `fully_shard()` 之后 |
+
+新增校验应放在 `_resolve_config_conflicts()` 末尾，因为这里已经能同时看到 model config、FSDP config、
+`Trainer.sp_size` 和 dataloader config。若放进 CLI，会遗漏直接调用 `Trainer.from_config()` 的入口；若只放进
+`FSDPConfig`，又看不到 MTP、FP8、SP 等跨配置约束。
+
+`Trainer.data_mesh` 只服务数据并行、SP 切序列和 TP 维度下的 batch 划分。第一阶段不能把它直接替换成
+MoE root mesh，否则会连带改变 `global_batch_size`、`micro_batch_size`、dataloader sampler 和
+`_prepare_model_input()` 的 SP 行为。
+
+### 6.3 `Trainer.fit()` 的影响
+
+当前单步训练调用链为：
+
+```text
+Trainer.fit()
+    |
+    +-> _data_iter()
+    +-> _prepare_model_input()
+    |       +-> SequenceContext.to(device)
+    |       +-> SP split（sp_size > 1 时）
+    |       +-> model.build_loss_ctx_batch(...)
+    |
+    +-> TrainEngine.train_step()
+    |       +-> model.pre_micro_batch_forward(...)
+    |       +-> model.forward(...)
+    |       +-> loss.backward()
+    |       +-> model.post_micro_batch_forward(...)
+    |
+    +-> TrainEngine.clip_grad_norm()
+    |       +-> model.scale_and_reduce_grad()
+    |       +-> cal_grad_norm(...)
+    |
+    +-> TrainEngine.step_optimizer()
+    +-> lr_scheduler.step()
+    +-> _maybe_save_hf() -> engine.save_hf() -> model.save_hf()
+    +-> _maybe_save()    -> engine.save_dcp()/async_save_dcp()
+    +-> gc.collect()（当前每 50 step）
+```
+
+`Trainer.fit()` 本身不需要增加分支，也不需要修改参数。解耦通过模型内部的 FSDP hook 生效，训练循环只在
+以下位置间接受影响：
+
+| `fit()` 路径 | 是否改接口 | 原因 |
+|---|---|---|
+| `_prepare_model_input()` / dataloader | 否 | 第一阶段不改数据 mesh、SP、packing 或 batch 语义 |
+| `TrainEngine.train_step()` | 否 | forward/backward 仍调用同一个 model；FSDP2 hook 负责各自 unshard/reshard |
+| `MoE.scale_and_reduce_grad()` | 改内部实现 | expert 保留 `1 / EP` 缩放；decoupled dense 不再做 EP 副本 all-reduce |
+| `cal_grad_norm()` | 不改签名 | 继续按 DTensor mesh/placement 分桶，但会同时看到 dense 和 expert 两种布局 |
+| `step_optimizer()` | 否 | optimizer 已绑定 FSDP 后的参数，更新流程不变 |
+| `_maybe_save_hf()` | Trainer 不改，model helper 要改 | HF gather 必须按参数角色选择 dense 或 expert FSDP mesh |
+| `_maybe_save()` / DCP | 公开接口不改 | 继续使用 PyTorch DCP；第一阶段只承诺相同 decoupled 拓扑恢复 |
+| hooks / profiler / 日志 / 每 50 step GC | 否 | 与参数 ownership 和 mesh 选择正交 |
+
+### 6.4 需要改动的接口总表
+
+| 文件与接口 | 是否改签名 | 计划改动 |
+|---|---|---|
+| `xtuner/v1/train/cli/sft.py::main` | 否 | 无代码改动，只保留统一 SFT 入口 |
+| `TrainerConfig` / `Trainer.from_config()` | 否 | `fsdp_cfg` 内部自然承载新字段 |
+| `Trainer.__init__()` | 否 | 复用 `_resolve_config_conflicts()` 做跨配置 fail-fast |
+| `Trainer._init_data_mesh()` | 否 | 保持数据 `(dp, sp, tp)` mesh，不参与模型参数分片 |
+| `Trainer.fit()` | 否 | 训练主循环保持不变 |
+| `TrainEngine.__init__()` / `build_model()` | 否 | 保持 `model.fully_shard(fsdp_cfg)` 这一扩展点 |
+| `MoE.fully_shard()` | 否 | 根据开关选择 coupled 或 decoupled nested FSDP2 |
+| `BaseModel._fully_shard()` | 是，内部接口 | 增加 `extra_ignored_params`，让 outer unit 排除 inner experts |
+| `MoE.scale_and_reduce_grad()` | 否 | 按参数真实 placement 选择缩放/规约 |
+| HF load/save 内部 helper | 是，内部接口 | 显式接收参数所属的 FSDP mesh，并按参数角色分桶 |
+| `TrainEngine.save_dcp/load_dcp()` | 否 | 继续调用 PyTorch state-dict/DCP API，不新造 checkpoint 格式 |
+
+结论是：这不是一次 Trainer 训练框架重写。SFT CLI、`Trainer.from_config()`、`Trainer.__init__()`、
+`Trainer.fit()` 和 `TrainEngine` 的公开调用方式都可以保持不变；主要代码改动仍集中在 FSDP config、MoE mesh、
+nested FSDP ownership、梯度规约和 HF 转换内部 helper。
+
+## 7. 兼容性矩阵
 
 | 能力 | 第一版结论 | 说明 |
 |---|---|---|
@@ -379,21 +514,23 @@ decoupled EP2 -> decoupled EP4
 | MoE TP | 当前实现不支持 | 不是本 PR 顺带解决的能力 |
 | coupled/decoupled 跨模式 DCP | 暂不支持 | 先使用 HF 中转 |
 
-## 7. 文件改动边界
+## 8. 文件改动边界
 
 | 文件 | 计划改动 |
 |---|---|
 | `xtuner/v1/config/fsdp.py` | 增加 `moe_fsdp_mesh` 配置 |
+| `xtuner/v1/train/cli/sft.py` | 不改；继续统一调用 `Trainer.from_config()` 和 `Trainer.fit()` |
+| `xtuner/v1/train/trainer.py` | 只在 `_resolve_config_conflicts()` 增加 decoupled 跨配置校验，公开入口不改 |
 | `xtuner/v1/model/moe/moe.py` | 单 root mesh、coupled/decoupled 分支、nested FSDP、ownership、梯度 |
 | `xtuner/v1/model/base.py` | 合并 ignored params；HF load/save 按参数角色选择 mesh |
-| `xtuner/v1/engine/train_engine.py` | 原则上不改格式，只补 DCP 验证和必要断言 |
+| `xtuner/v1/engine/train_engine.py` | 公开接口和训练流程不改；必要时只补 mesh/ownership 断言 |
 | `tests/model/test_moe_decoupled_fsdp.py` | topology、placement、ownership、grad、HF round-trip |
 | `tests/engine/test_moe_decoupled_checkpoint.py` | DCP model/AdamW/scheduler/step 连续性 |
 | GLM-5.2 recipe | 增加 decoupled 实验配置，不替换默认 recipe |
 
 第一阶段不修改 dispatcher、DSA、Indexer、router 或 grouped GEMM 实现。
 
-## 8. 风险
+## 9. 风险
 
 1. **HF checkpoint 静默错误**：mesh 用错可能不立刻报错，却会加载错误 slice 或导出重复权重。
 2. **重复 ownership**：expert 同时被 inner 与 outer FSDP 管理会导致重复 hook 或 collective 错序。
@@ -403,9 +540,9 @@ decoupled EP2 -> decoupled EP4
 6. **完整模型外推风险**：6 层模型的参数比例、通信占比和完整 GLM-5.2 不相同。
 7. **多维并行扩展**：未来加入 TP/SP/PP 后，dense mesh 不能简单 flatten 所有 rank，需要统一 root 设计。
 
-## 9. 验收标准
+## 10. 验收标准
 
-### 9.1 静态 topology 与 ownership
+### 10.1 静态 topology 与 ownership
 
 - EP2：`dense_fsdp=8`、`expert_fsdp=4`、`ep=2`；
 - EP4：`dense_fsdp=8`、`expert_fsdp=2`、`ep=4`；
@@ -414,7 +551,7 @@ decoupled EP2 -> decoupled EP4
 - `MoEDecoderLayer.experts` 只归 expert unit；
 - 每个 trainable parameter 恰好归一个 FSDP unit。
 
-### 9.2 数值
+### 10.2 数值
 
 - 固定 seed、固定 pack、固定 batch；
 - coupled/decoupled 第 1 步 loss、grad_norm、参数 delta 在约定容差内；
@@ -422,7 +559,7 @@ decoupled EP2 -> decoupled EP4
 - EP2 与 EP4 的有效 global batch、token 数、学习率和 optimizer 设置一致；
 - expert 梯度仍只做 `1 / EP` 缩放，dense 不重复 all-reduce。
 
-### 9.3 checkpoint
+### 10.3 checkpoint
 
 - decoupled EP2/EP4 strict HF load；
 - train -> sync HF export -> 独立 loader strict reload；
@@ -430,14 +567,14 @@ decoupled EP2 -> decoupled EP4
 - 同拓扑 DCP 恢复 model、AdamW、scheduler、train step；
 - resume 后下一步与未中断 run 对齐。
 
-### 9.4 显存和性能
+### 10.4 显存和性能
 
 - PyTorch memory snapshot 能看到 dense 参数和 optimizer state 的 active memory 下降；
 - 同时记录 max allocated、reserved、steady-state step time 和 collective 时间；
 - 先验证 6 层 EP2/EP4，再验证完整 NoMTP 模型 load、2 step、HF export、DCP resume；
 - 多机结果出来前，不宣称该设计一定提升吞吐。
 
-## 10. 建议提交顺序
+## 11. 建议提交顺序
 
 1. `refactor(moe): build EP and FSDP views from one root mesh`
    只收口 root 创建，保持 coupled placement 与数值行为。
@@ -451,14 +588,14 @@ decoupled EP2 -> decoupled EP4
    完整模型显存、时间、HF 与 DCP 报告。
 6. 后续分别补 DeepEP/CUTLASS、SP、compile、offload、FP8、MTP，避免一个 PR 同时改变过多变量。
 
-## 11. 评审时需要确认的问题
+## 12. 评审时需要确认的问题
 
 1. 第一版开关名是否采用 `moe_fsdp_mesh`，还是项目希望统一为更通用的 parallel strategy 配置。
 2. 第一版是否只承诺 AdamW；Muon 对 mesh 维名称有字符串匹配逻辑，需要单独回归。
 3. 同步 HF export 是否必须和首个训练 PR 同时落地。本文建议必须，否则无法验证权重闭环。
 4. 完整模型验证使用 EP2 还是 EP4 作为第一条生产链路。EP4 dense 通信增量更大，更能暴露问题。
 
-## 12. 伪代码说明
+## 13. 伪代码说明
 
 `glm52_decoupled_fsdp.py` 按真实改动文件分段，展示：
 
@@ -466,8 +603,11 @@ decoupled EP2 -> decoupled EP4
 - 单 root mesh 及三种 mesh view；
 - 参数角色索引；
 - coupled 保持逻辑和 decoupled nested FSDP 主流程；
+- SFT CLI、`Trainer.__init__()`、`Trainer.fit()` 与 `TrainEngine` 的调用边界；
 - 梯度处理；
 - mesh-aware HF load/save；
-- DCP 与测试骨架。
+- 复用现有 DCP 的保存恢复边界。
 
-它是设计伪代码，不可直接复制运行；真实实现必须拆成上述提交并逐步通过测试。
+测试方案和验收口径保留在本文第 10 节，不在伪代码文件中重复编写测试函数。
+
+它是设计伪代码，不可直接复制运行；真实实现必须按上述文件边界拆分提交并逐步通过测试。
