@@ -1,15 +1,34 @@
 # GLM-5.2 Indexer SFT 调研
 
-> 更新时间：2026-08-13
+> 更新时间：2026-08-19
 >
 > 核对版本：XTuner `9dabb956`，NeMo AutoModel `e2c48886`
 >
+> 新增核对：Megatron-LM `5d50b16e`。GLM-5.2 的模型映射与完整 SFT recipe 位于
+> Megatron-Bridge；Megatron-LM 提供通用 DSA / Indexer loss 训练内核。
+>
 > 调研范围：DSA Indexer 的训练语义、GLM-5.2 普通 SFT 中的实际行为、IndexShare、
 > checkpoint，以及 XTuner 若要支持 Indexer warm-up / 联合训练需要补齐的能力。
+>
+> 对应落地方案与接口伪代码：`docs/design/glm52_indexer_sft.md`、
+> `docs/design/glm52_indexer_sft.py`。
 
 ## 1. 先说结论
 
 当前最容易混淆的是“带 Indexer 跑 SFT”和“训练 Indexer”并不是一回事。
+
+2026-08-19 补充核对后，还需要进一步区分“Megatron-LM 有完整 Indexer loss 内核”和
+“Megatron-LM 仓库单独提供完整 GLM-5.2 SFT recipe”：前者成立，后者不成立。完整的
+GLM-5.2 端到端组合是 **Megatron-Bridge（模型 provider、HF 权重转换、SFT recipe）+
+Megatron-LM/Megatron-Core（DSA、Indexer KL、反向和并行训练）**。
+
+| 项目 | GLM-5.2 SFT | Indexer 辅助监督 | 准确结论 |
+|---|---|---|---|
+| XTuner | 是 | 否 | 冻结 Indexer，只使用预训练 Top-K |
+| NeMo AutoModel | 是 | 否 | 有 DSA/IndexShare，但没有 Indexer KL |
+| Megatron-LM / Megatron-Core | 训练内核，不是独立 GLM-5.2 recipe | 是 | DSA Indexer loss 的完整底层实现 |
+| Megatron-Bridge + Megatron-LM | 是 | 是 | 当前最完整的 GLM-5.2 Indexer 联合 SFT 参考 |
+| ms-swift / Megatron-SWIFT | 是 | 可选 | 暴露同一套参数，默认系数为 0，需要显式开启 |
 
 | 场景 | 主模型 | Indexer | 损失 | 当前 XTuner |
 |---|---|---|---|---|
@@ -212,7 +231,8 @@ GLM-5 技术报告给出的 DSA warm-up 为 1000 step。报告中的小规模验
 路径 2: detach(hidden) -> Indexer scores -> KL loss -> Indexer 参数
 ```
 
-参考 DSA 方案会 detach Indexer 的输入，使两套梯度彼此独立：
+参考 DeepSeek Sparse Attention（DSA；部分资料也称 Dynamic Sparse Attention）训练方案会
+detach Indexer 的输入，使两套梯度彼此独立：
 
 - LM loss 不借 Indexer 分支更新主模型；
 - Indexer KL 不通过输入反向修改主模型；
@@ -258,7 +278,7 @@ LM loss
 - 选择 sparse MLA backend；
 - 配置 AdamW/Muon、FSDP、EP、SP 和 checkpoint。
 
-这里没有 Indexer KL loss、dense attention teacher、Indexer 专用 optimizer 或 warm-up/joint
+这里没有 Indexer KL loss、attention teacher、可训练的 Indexer optimizer 参数或 warm-up/joint
 stage scheduler。对应代码在 `examples/v1/config/sft_glm5p2.py:35-130`。
 
 ### 5.2 Indexer 被显式冻结
@@ -295,6 +315,20 @@ AdamW 构建时只接收 `requires_grad=True` 的参数，因此 Indexer 不会�
 
 这对普通 SFT 足够，却无法计算 Indexer KL loss。Indexer 训练至少需要让 backend 提供
 可微分 `index_scores`，或者提供一个专门的 training-score/recompute 接口。
+
+当前 XTuner 中 `torch/tilelang/cudnn_dsa` 是同一个配置槽位的并列选项，但实现并不完全
+对称：
+
+| XTuner backend | Indexer Top-K | SparseMLA forward | SparseMLA backward |
+|---|---|---|---|
+| `torch` | PyTorch | PyTorch | PyTorch autograd |
+| `tilelang` | TileLang | TileLang | TileLang |
+| `cudnn_dsa` | TileLang | TileLang | cuDNN DSA |
+
+因此 XTuner 当前的 `cudnn_dsa` 是混合 backend，不是全套 cuDNN DSA。它仍依赖 TileLang
+Indexer 和 TileLang forward，只把 SparseMLA backward 换成 cuDNN frontend 提供的
+`sparse_attention_backward_wrapper`。Megatron-LM 中的 cuDNN backend 覆盖范围更完整，不应
+与 XTuner 的同名选项直接画等号。
 
 ### 5.4 IndexShare：`full` 层计算，`shared` 层复用
 
@@ -358,7 +392,8 @@ model.layers.<shared-layer>.self_attn.indexer.weights_proj.weight
 
 ### 5.6 frozen Indexer 的 checkpoint 语义
 
-XTuner 的默认配置 `dcp_ignore_frozen_params=True`，DCP 收集 state dict 时会忽略冻结参数：
+这里的 DCP 是 PyTorch Distributed Checkpoint（分布式训练检查点）。XTuner 的默认配置
+`dcp_ignore_frozen_params=True`，DCP 收集 state dict 时会忽略冻结参数：
 
 - 默认值：`xtuner/v1/model/base.py:147`
 - DCP options：`xtuner/v1/engine/train_engine.py:323-336`
@@ -422,9 +457,171 @@ optimizer 参数管理开销，应通过运行时 `requires_grad/grad/optimizer.
 RoPE 会改变 Indexer Q/K，从而可能改变 top-k。这里可以确认“源码路径不同”，但在没有用
 同一权重和输入做 top-k overlap 前，不应直接写成 AutoModel 数值错误。
 
-## 7. 如果要在 XTuner 真正支持 Indexer SFT，需要改什么
+## 7. Megatron-LM：目前最值得借鉴的实现
 
-### 7.1 建议的模式开关
+### 7.1 “完整实现”到底指什么
+
+本地 `/home/liutong/ZmyCode/Megatron-LM` 的 `5d50b16e` 已经包含一套完整的通用 DSA
+Indexer 辅助监督内核，包括：
+
+- dense/sparse 两种 Indexer KL；
+- Indexer 输入和 attention teacher 的梯度隔离；
+- Top-K、KL、手写 backward/recompute；
+- TileLang 与 cuDNN fused backend hook；
+- packed THD、TP、CP 和 IndexShare runtime；
+- pipeline/microbatch loss scale 与日志；
+- loss 数学、mask、梯度和并行后端 parity 测试。
+
+但 **Megatron-LM 仓库本身不是完整的 GLM-5.2 SFT 产品入口**。GLM-5.2 的 HF config
+映射、权重转换和 GB200/H100 SFT recipe 在 Megatron-Bridge。准确关系是：
+
+```text
+Megatron-Bridge
+  ├─ GLM5Bridge：HF <-> Megatron 权重映射
+  ├─ GLM-5.2 provider：把 HF 的 IndexShare/RoPE/Top-K 配置写入 Megatron
+  └─ 128K packed SFT recipe
+             |
+             v
+Megatron-LM / Megatron-Core
+  ├─ DSA Indexer
+  ├─ Indexer KL + backward
+  ├─ Sparse MLA
+  └─ TP / CP / PP / packed THD
+```
+
+Megatron-Bridge 的 GLM-5.2 provider 默认设置：
+
+```python
+dsa_indexer_loss_coeff = 0.001
+dsa_indexer_use_sparse_loss = True
+```
+
+所以“Megatron 体系能在 GLM-5.2 SFT 中训练 Indexer”是已经落地的事实；但只下载
+Megatron-LM，还缺 GLM-5.2 provider、HF bridge 和 recipe。
+
+### 7.2 它如何构造监督目标
+
+Megatron 没有额外运行一遍完整 dense attention 的 `P @ V`。它直接复用主 MLA 已经算出的
+`query/key`，重算 dense attention logits 作为 teacher：
+
+```text
+main query/key --detach--> softmax(query @ key^T * scale) per head
+                                  |
+                                  v
+                    sum over heads + TP all-reduce
+                                  |
+                                  v
+                         L1 normalize -> target p
+
+Indexer q/k/weights -> index_scores -> log_softmax -> prediction log q
+
+L_indexer = coeff * KL(p || q)
+```
+
+对应代码：
+
+- `compute_dsa_indexer_loss()`：构造 teacher、聚合 attention heads、计算 KL；
+- `dsa_indexer_loss.py`：L1 normalize 和 `KL(target || predict)` 的公共数学；
+- `dsa_indexer_use_sparse_loss=False`：在全部合法 causal keys 上计算 dense KL；
+- `dsa_indexer_use_sparse_loss=True`：只在当前 Top-K 集合上计算 sparse KL。
+
+这修正了本文前面的一个过强假设：**实现 joint Indexer loss 不一定需要另建一套完整 dense
+attention forward**。需要的是主 MLA 的 Q/K teacher logits；真正困难的是长序列下不能保存或
+长期持有巨大的 score 矩阵。
+
+### 7.3 两条梯度如何隔离
+
+Megatron 在 Indexer 入口执行：
+
+```python
+x = x.detach()
+qr = qr.detach()
+```
+
+在 teacher 入口又传入：
+
+```python
+query.detach(), key.detach()
+```
+
+因此：
+
+- LM loss 通过 SparseMLA 更新主模型；
+- Indexer KL 只更新 `wq_b/wk/k_norm/weights_proj`；
+- KL 不会通过 hidden states 或主 attention Q/K 反向污染 backbone；
+- 离散 Top-K 仍然不承担梯度。
+
+它再用 `DSAIndexerLossAutoScaler.apply(attention_output, indexer_loss)` 把 KL 挂到主 attention
+output 上。前向返回值不变；主 LM loss backward 经过该节点时，自动触发 KL backward。
+
+XTuner 已经有语义相同的 `xtuner/v1/loss/aux_loss.py::AuxLossScaler`，因此这一部分不需要
+重新照抄 Megatron 的 AutoScaler；可以直接复用现有基础设施，把每个 `full` Indexer 的 KL
+挂到对应 attention output。
+
+### 7.4 它如何控制长序列显存
+
+Megatron 的 reference 路径使用 `FusedDSAIndexerLoss` 自定义 autograd：forward 计算 Top-K
+和 KL，但不把完整 score 保存到 backward；backward 时重新计算并直接生成
+`grad_q/grad_k/grad_weights`。
+
+这里要准确理解：reference 路径仍会在 forward/backward **瞬时物化** `[S,S]` Indexer
+score 和 `[heads,S,S]` teacher score，只是不会跨 forward/backward 长期保存。因此它适合
+短序列正确性验证，不适合直接拿来跑 16K/128K。
+
+生产长上下文依赖 backend hook：
+
+| backend | Indexer loss 能力 | 用途 |
+|---|---|---|
+| `none` / PyTorch reference | dense + sparse，backward 重算 | 数学与梯度 oracle、小序列测试 |
+| TileLang | fused Top-K + sparse Indexer loss | 开源性能参考 |
+| cuDNN | fused DSA forward/backward + dense/sparse loss | GLM-5.2 128K 生产 recipe |
+
+因此 XTuner 若只移植 PyTorch reference，能证明“算法接对了”，但不能解决 16K 实训显存；
+后续仍要接 TileLang sparse-loss 或 cuDNN fused DSA loss。
+
+### 7.5 IndexShare 的当前边界
+
+Megatron 支持 `dsa_indexer_topk_freq` 和 `dsa_indexer_skip_topk_offset`：只有 computing/full
+层创建并运行 Indexer，shared/skip 层复用 Top-K。
+
+但当前 `use_indexer_loss` 条件包含 `computes_topk`，所以：
+
+- full 层：用该层自身的 main attention Q/K 构造 teacher 并训练 Indexer；
+- shared 层：复用 Top-K，不计算 Indexer loss；
+- 没有把后续多个 shared 层的 teacher 聚合回来监督 source Indexer。
+
+所以它是“**支持 IndexShare runtime 的 Indexer 联合训练**”，但不是本文 8.4
+设想的“多层 teacher 蒸馏”。XTuner 第一阶段可以先与 Megatron 行为对齐，多层蒸馏应作为
+独立增强实验，不能写成移植 Megatron 的必要条件。
+
+### 7.6 XTuner 应该借什么
+
+建议借鉴实现边界，而不是整文件复制：
+
+| 可以直接借鉴 | XTuner 中的落点 |
+|---|---|
+| target 构造、L1 normalize、KL 公式 | 新增 `xtuner/v1/loss/dsa_indexer_loss.py` |
+| hidden/teacher detach 语义 | `DSAIndexer` 与 `DSAMultiLatentAttention.forward()` |
+| reference backward 重算和梯度公式 | 新增短序列 correctness backend |
+| dense/sparse loss 配置 | `DSAMLAConfig` / GLM-5.2 config |
+| backend hook 的 fixed-ID loss 契约 | 保留 `DSATopKIndicesProtocol`，另增训练 loss protocol |
+| mask/梯度/backend parity 测试 | `tests/` 新增 DSA Indexer loss 测试 |
+| aux loss 挂载 | 直接复用 XTuner 已有 `AuxLossScaler` |
+
+不能原样复制的部分主要是 Megatron 的 SBHD layout、`ProcessGroupCollection`、TP/CP gather、
+pipeline loss scale 和 packed THD mask。XTuner 使用自己的 `SequenceContext`、SP mesh、FSDP 和
+batch loss context，这些必须按 XTuner runtime 重写。
+
+### 7.7 Megatron 方案仍不等于完整 warm-up 管理器
+
+Megatron 已有 joint loss 内核，但没有一个通用的 `frozen -> warmup -> joint` 阶段调度器。
+Indexer warm-up 仍需要 recipe 负责冻结 backbone、只让 Indexer 进入 optimizer，并控制阶段
+切换。基础 joint SFT 也不强制独立 optimizer param group：Indexer 可以与主模型共用 LR；
+只有需要单独 `indexer_lr` 或 warm-up/resume 语义时，才必须拆 param group。
+
+## 8. 如果要在 XTuner 真正支持 Indexer SFT，需要改什么
+
+### 8.1 建议的模式开关
 
 建议不要复用一个模糊的 `TRAIN_INDEXER=1`，而是明确区分：
 
@@ -443,41 +640,50 @@ indexer_teacher: Literal["dense_attention"] = "dense_attention"
 
 默认必须保持 `frozen`，以兼容现有 GLM-5.2 下游 SFT 和 checkpoint。
 
-### 7.2 模型与算子接口
+### 8.2 模型与算子接口
 
-当前 `DSATopKIndicesProtocol` 只返回 IDs，建议引入训练专用输出：
+当前 `DSATopKIndicesProtocol` 只返回 IDs。最终设计保留这个 frozen/eval/推理契约，另增
+针对固定 Top-K IDs 的训练 loss 协议：
 
 ```python
-class DSAIndexerOutputs(NamedTuple):
-    topk_indices: torch.Tensor
-    index_scores: torch.Tensor | None
+class DSAIndexerLossProtocol(Protocol):
+    def __call__(
+        self,
+        indexer_inputs,
+        detached_teacher,
+        fixed_topk_indices,
+        seq_ctx,
+    ) -> DSAIndexerLossStats: ...
 ```
 
 需要处理：
 
-1. PyTorch backend 返回带梯度的 `index_scores`。
-2. TileLang/cuDNN backend 要么返回 score，要么提供可重算 score 的训练接口。
-3. 普通 `frozen` 模式仍只返回 IDs，避免保存巨大的 `[S,S]` score。
-4. packed sequence 的 causal mask、序列边界和 SP global-K 必须与现有 top-k 完全一致。
+1. PyTorch reference 在固定 IDs 上重建可导 Indexer 图，并返回归约后的 scalar loss。
+2. TileLang/cuDNN backend 提供等价的 fixed-ID 或内部 fused loss，不向上暴露完整 score。
+3. checkpoint replay 复用 original IDs，并用同一 loss 协议重建梯度。
+4. 普通 `frozen` 模式仍只返回 IDs，避免改变既有返回类型。
+5. packed sequence 的 causal mask、序列边界和 SP global-K 必须与现有 top-k 完全一致。
 
 最大的工程风险是显存。`index_scores` 为 `[S,S]`，16K 序列的 FP32 单层矩阵约 1 GiB，
 还没算 head 中间值和多层 teacher。不能直接让所有层同时保存完整 score，需要 chunk、重算、
 逐层消费或专用 fused loss。
 
-### 7.3 teacher attention 与 Indexer loss
+### 8.3 teacher attention 与 Indexer loss
 
 warm-up 阶段需要 dense attention teacher；joint 阶段至少需要被选 token 上的 teacher
-distribution。当前 absorbed SparseMLA 只返回 attention output 和 `softmax_lse`，不提供完整
-teacher distribution，因此还需新增：
+distribution。参考 Megatron 后，不必要求 SparseMLA kernel 返回完整 attention probability，
+可以从进入 SparseMLA 前的主 attention Q/K 重算 teacher logits。因此还需新增：
 
-- dense MLA teacher 路径或等价 score recompute；
+- 主 MLA Q/K 的 teacher score recompute；
 - 跨 head 聚合与 L1 normalize；
 - causal/packing-aware KL；
 - joint 阶段 selected-set KL；
 - teacher target `detach()`；
 - Indexer 输入与主模型计算图解耦。
 
-### 7.4 IndexShare-aware loss
+短序列 reference 可以直接物化 score；16K 以上必须走 chunk/recompute 或 fused sparse-loss。
+
+### 8.4 IndexShare-aware loss
 
 GLM-5.2 的 `full` Indexer 要服务后续多个 `shared` 层。只让它拟合自己的 attention
 distribution，不一定能为 shared 层选好 token。
@@ -493,11 +699,12 @@ full layer l 的 Indexer
 ```
 
 即让该 Indexer 拟合它所服务层的平均/多项 attention 分布。若目标是复现 GLM-5.2 的
-IndexShare 训练语义，这部分不能省略。
+多层蒸馏训练语义，这部分不能省略；若第一阶段目标只是复现 Megatron-Bridge 当前 SFT，
+则先让 full 层只拟合自身 teacher 即可，shared 多层目标应列为后续增强实验。
 
-### 7.5 optimizer 与 checkpoint
+### 8.5 optimizer 与 checkpoint
 
-建议为 Indexer 建立独立 param group：
+如果需要独立 `indexer_lr` 或 warm-up 阶段切换，建议为 Indexer 建立独立 param group：
 
 ```text
 backbone group: main_lr，仅接收 LM loss
@@ -510,7 +717,7 @@ indexer group:  indexer_lr，仅接收 KL loss
 - `joint`：两者都 trainable，都必须进入 DCP 与 optimizer state。
 - 模式切换 resume 时必须检查 checkpoint 中的 param group 与训练阶段。
 
-## 8. 推荐的验证顺序
+## 9. 推荐的验证顺序
 
 ### P0：确认现有 frozen SFT 没有回归
 
@@ -534,24 +741,26 @@ indexer group:  indexer_lr，仅接收 KL loss
 
 应优先验证 interleaved 与 half-split RoPE 差异，不能只比较最终 200-step loss 后再猜原因。
 
-### P2：最小 Indexer warm-up
+### P2：最小 joint Indexer loss
 
-先用 tiny 模型、短序列和 PyTorch backend 验证：
+先按 Megatron 语义，用 tiny 模型、短序列和 PyTorch backend 验证：
 
-1. backbone grad 全为 `None`；
-2. Indexer grad finite 且非零；
+1. LM loss 关闭、只反传 Indexer KL 时，backbone grad 全为 `None`；
+2. 联合反传时，Indexer grad finite 且非零，主模型梯度与 frozen baseline 分支语义一致；
 3. KL loss 连续下降；
-4. Indexer top-k 对 dense teacher top-k 的 recall/overlap 上升；
-5. DCP/HF round-trip 后指标不变。
+4. `AuxLossScaler` 前后 attention output 数值完全相同；
+5. 手写/recompute gradient 与 PyTorch autograd oracle 对齐；
+6. DCP/HF round-trip 后指标不变。
 
 ### P3：joint 与 IndexShare
 
 1. LM loss 只更新 backbone 路径，KL 只更新 Indexer 路径。
-2. full layer 的多层蒸馏 loss 正确覆盖对应 shared layers。
-3. activation checkpoint、compile、SP、MTP 下 cache 生命周期无泄漏。
-4. 与 frozen SFT 对比长上下文 eval loss、RULER/NIAH 和吞吐。
+2. 先验证 Megatron 同款“full 层自身 teacher”，再单独验证多层蒸馏是否有收益。
+3. activation checkpoint、compile、SP 下 cache 生命周期无泄漏；MTP 在第一版明确拒绝，单独定义目标后再测。
+4. TileLang/cuDNN fused sparse-loss 与 PyTorch reference 的 loss/gradient 对齐。
+5. 与 frozen SFT 对比长上下文 eval loss、RULER/NIAH 和吞吐。
 
-## 9. 当前风险与建议
+## 10. 当前风险与建议
 
 | 风险 | 影响 | 建议 |
 |---|---|---|
@@ -562,12 +771,12 @@ indexer group:  indexer_lr，仅接收 KL loss
 | XTuner/AutoModel RoPE 路径不同 | top-k 与最终 loss 可能偏离 | 建立 score/top-k parity 测试 |
 | DCP 忽略 frozen 参数 | 单独搬 DCP 无法完整恢复 | 固定并记录 base HF checkpoint |
 
-建议当前先保持 XTuner 的 frozen Indexer 行为，不直接改训练主链。下一步最有价值的工作不是
-马上跑大规模 Indexer 训练，而是先补一套小模型的 `index_scores/top-k overlap` parity 工具，
-确认 XTuner、HF 与 AutoModel 的 RoPE、mask、score scale 和 IndexShare 均一致。数值基线稳定
-后，再按 `warmup -> joint -> IndexShare-aware` 的顺序开发。
+建议默认继续保持 XTuner 的 frozen Indexer 行为，同时以 Megatron-LM 为 oracle 开一条小模型
+实验分支。先完成短序列 PyTorch joint loss、梯度隔离和 `index_scores/top-k` parity，再接
+TileLang/cuDNN fused sparse-loss，最后才跑 16K/长上下文 SFT。warm-up 阶段管理和 IndexShare
+多层 teacher 都不是第一版必需项，应在 Megatron 同款 joint SFT 对齐后再开发。
 
-## 10. 资料与源码索引
+## 11. 资料与源码索引
 
 ### 论文与官方资料
 
@@ -578,6 +787,10 @@ indexer group:  indexer_lr，仅接收 KL loss
 - [IndexCache / IndexShare](https://arxiv.org/abs/2603.12201)：full/shared 层、training-free pattern
   与多层蒸馏目标。
 - [GLM-5.2 官方仓库](https://github.com/zai-org/GLM-5)：GLM-5.2 与 IndexShare 说明。
+- [Megatron-Bridge GLM-5.2 长上下文 SFT](https://github.com/NVIDIA-NeMo/Megatron-Bridge/discussions/4957)：
+  128K packed SFT、Indexer loss、cuDNN DSA 与性能结果。
+- [Megatron-Bridge GLM5Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/src/megatron/bridge/models/glm_moe_dsa/glm5_bridge.py)：
+  GLM-5.2 provider、HF 映射以及默认 `loss_coeff=0.001`、sparse loss。
 
 ### XTuner `9dabb956`
 
@@ -602,12 +815,26 @@ indexer group:  indexer_lr，仅接收 KL loss
 | IndexShare 跨层/PP 传递 | `nemo_automodel/components/models/glm_moe_dsa/model.py` |
 | HF state-dict 与 Indexer 量化处理 | `nemo_automodel/components/models/glm_moe_dsa/state_dict_adapter.py` |
 
-## 11. 可直接用于汇报的一段话
+### Megatron-LM `5d50b16e`
+
+| 内容 | 文件 |
+|---|---|
+| DSA Indexer、teacher 构造、KL/autograd 接入 | `megatron/core/transformer/experimental_attention_variant/dsa.py` |
+| backend-independent KL 数学 | `megatron/core/transformer/experimental_attention_variant/dsa_indexer_loss.py` |
+| TileLang backend hook | `megatron/core/transformer/experimental_attention_variant/dsa_tilelang_kernels.py` |
+| cuDNN fused DSA + Indexer loss | `megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py` |
+| backend 分发 | `megatron/core/transformer/experimental_attention_variant/dsa_kernels.py` |
+| 配置项 | `megatron/core/transformer/transformer_config.py` |
+| loss/mask/梯度/TP 测试 | `tests/unit_tests/transformer/experimental_attention_variant/test_attention_variant_dsa.py` |
+| TileLang/cuDNN/TP/SP/CP parity | `tests/unit_tests/transformer/experimental_attention_variant/test_dsa_backend_tp_sp_parity.py` |
+
+## 12. 可直接用于汇报的一段话
 
 > 目前 XTuner 已支持带 DSA/IndexShare 的 GLM-5.2 常规 SFT，但这里是“使用 Indexer”，
 > 不是“训练 Indexer”。最新代码会显式冻结 Indexer，并让它在 no-grad 下产生离散 top-k；
-> 主模型继续由 LM loss 更新。真正的 Indexer warm-up 需要保留 dense attention 作为 teacher，
-> 用 top-k 前的可微分 score 计算 KL loss；联合 sparse adaptation 还要把主模型 LM loss 与
-> Indexer KL 的梯度分开。当前 XTuner 和 AutoModel 都没有这套完整 recipe。XTuner 若要补齐，
-> 核心改动是 score backend、teacher attention、KL loss、独立参数组、IndexShare 多层蒸馏和
-> checkpoint stage 兼容，而不是简单解除冻结。
+> 主模型继续由 LM loss 更新。Megatron-LM 已经提供完整的通用 DSA Indexer KL、梯度隔离、
+> backward 重算以及 TileLang/cuDNN backend；Megatron-Bridge 再补齐 GLM-5.2 provider、HF 权重
+> 转换和 128K SFT recipe，并默认使用 `0.001` sparse Indexer loss。XTuner 可以直接借鉴其
+> teacher Q/K 重算、KL 数学和 detach 语义，并复用项目已有 `AuxLossScaler`；但 SP/FSDP mask、
+> backend 接口和 checkpoint 必须按 XTuner runtime 重写。第一版应先对齐 Megatron 的短序列
+> joint loss 与梯度，再接 fused sparse-loss，而不是只解除 Indexer 冻结。
