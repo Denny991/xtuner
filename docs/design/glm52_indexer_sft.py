@@ -1,29 +1,31 @@
 """GLM-5.2 DSA Indexer 联合 SFT 设计伪代码。
 
 设计要点：
-- frozen 是兼容路径：沿用当前 DSAIndexer.forward() -> Top-K Tensor。
+- frozen 采用显式 DSAIndexerOutput/GLM52AttnOutputs.dsa_topk_ids 数据流。
 - joint 在固定 Top-K support 上计算 attention-teacher KL，只更新 Indexer。
-- 当前 CrossLayerTopKSharingRuntime 仍是 Top-K cache 的唯一 owner。
-- reentrant checkpoint replay 复用 original IDs，并重新建立可导 KL 图。
+- source/shared 通过 decoder 显式传 IDs，不扩展 SequenceContext mutable cache。
+- reentrant checkpoint frame 只复用 original IDs；replay 重算可导投影与 fixed-ID KL。
+- canonical head_weights 只含 H^-1/2；qk_scale 只含 D^-1/2。
+- 可选 query chunk 只优化 no-grad Top-K selection，不分块第一版 loss/backward。
 - loss context 使用整个 train step 的有效 query 分母，不做 micro-batch mean 的平均。
 - PyTorch 只作有显存门禁的 oracle；长序列 TileLang/cuDNN adapter 未接通前 fail fast。
 
 说明：
 - 这是接口和控制流伪代码，不是可直接合入的实现。
 - 名称尽量贴近 XTuner 当前模块；省略 HF mapping、FSDP 和 kernel 样板代码。
+- 入门伴读见 docs/design/glm52_indexer_sft_beginner_guide.md。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Literal, NamedTuple, Protocol, TypedDict
+from typing import Any, Literal, NamedTuple, Protocol, TypedDict
 
 import torch
 import torch.distributed as dist
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from torch import nn
+from typing_extensions import NotRequired
 
 from xtuner.v1.config import AdamWConfig
 
@@ -73,27 +75,45 @@ class DSAMLAConfig(BaseModel):
 
     indexer_train_mode: IndexerTrainMode = "frozen"
     indexer_loss_cfg: DSAIndexerLossConfig | None = None
+    indexer_topk_query_chunk_size: int | None = None
     sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa"] = "torch"
 
     def build(self, **runtime_args) -> "DSAMultiLatentAttention":
         validate_indexer_training_config(self.indexer_train_mode, self.indexer_loss_cfg)
+        if (
+            self.indexer_topk_query_chunk_size is not None
+            and self.indexer_topk_query_chunk_size <= 0
+        ):
+            raise ValueError("indexer_topk_query_chunk_size must be positive")
+        if (
+            self.indexer_topk_query_chunk_size is not None
+            and self.sparse_mla_backend not in {"tilelang", "cudnn_dsa"}
+        ):
+            raise ValueError("P0 query-chunk Top-K requires a TileLang selector")
+
+        # 保留现有 main SparseMLA + selector preflight；不能只 probe 新 loss adapter。
+        ensure_sparse_mla_and_selector_runtime_available(self.sparse_mla_backend)
 
         # 当前真实 build 使用 **self.model_dump()。nested BaseModel 会变成 dict，
         # 所以新增配置必须 exclude 后显式传对象，不能假定 module 收到 config 实例。
         kwargs = self.model_dump(
-            exclude={"indexer_train_mode", "indexer_loss_cfg"}
+            exclude={
+                "indexer_train_mode",
+                "indexer_loss_cfg",
+                "indexer_topk_query_chunk_size",
+            }
         )
-        loss_op = (
-            build_indexer_loss_backend(self.indexer_loss_cfg)
-            if self.indexer_loss_cfg is not None
-            else None
+        indexer_backend = build_indexer_backend(
+            selection_backend=self.sparse_mla_backend,
+            query_chunk_size=self.indexer_topk_query_chunk_size,
+            loss_cfg=self.indexer_loss_cfg,
         )
         return DSAMultiLatentAttention(
             **kwargs,
             **runtime_args,
             indexer_train_mode=self.indexer_train_mode,
             indexer_loss_cfg=self.indexer_loss_cfg,
-            indexer_loss_op=loss_op,
+            indexer_backend=indexer_backend,
         )
 
 
@@ -106,21 +126,38 @@ class SequenceContext(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
+def ensure_sparse_mla_and_selector_runtime_available(backend: str) -> None: ...
+
+
 class DSAIndexerInputs(NamedTuple):
     """可导 Indexer 投影；输入 hidden/q_resid 已 detach。"""
 
     q: torch.Tensor  # [B, S_q_local, H_index, D_index]
     k: torch.Tensor  # [B, S_k_global, D_index]
-    weights: torch.Tensor  # [B, S_q_local, H_index]
+    # canonical FP32 表示：weights_proj / sqrt(H_index)，不含 D_index scale。
+    head_weights: torch.Tensor  # [B, S_q_local, H_index]
     index_head_dim: int
+
+    @property
+    def qk_scale(self) -> float:
+        return self.index_head_dim**-0.5
+
+    def effective_weights(self, dtype: torch.dtype) -> torch.Tensor:
+        """仅供 sm_scale=1 backend adapter；保留 autograd。"""
+
+        return (self.head_weights * self.qk_scale).to(dtype)
 
     def detached(self) -> "DSAIndexerInputs":
         return DSAIndexerInputs(
             self.q.detach(),
             self.k.detach(),
-            self.weights.detach(),
+            self.head_weights.detach(),
             self.index_head_dim,
         )
+
+
+class DSAIndexerOutput(TypedDict):
+    dsa_topk_ids: torch.Tensor  # contiguous int32 [S_q,1,K]
 
 
 class DSAIndexerTeacher(NamedTuple):
@@ -141,25 +178,18 @@ class DSAIndexerLossStats(NamedTuple):
     valid_rows: torch.Tensor
 
 
-class DSATopKIndicesProtocol(Protocol):
-    """现有 IDs-only 协议保持不变。"""
+class DSAIndexerBackendProtocol(Protocol):
+    """模型层统一 facade；legacy IDs selector 只作为内部 adapter。"""
 
-    def __call__(
+    def select_topk(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        weights: torch.Tensor,
+        indexer: DSAIndexerInputs,
         seq_ctx: SequenceContext,
         *,
-        index_head_dim: int,
         index_topk: int,
     ) -> torch.Tensor: ...
 
-
-class DSAIndexerLossProtocol(Protocol):
-    """针对 original forward 已确定的 IDs 计算 KL。"""
-
-    def __call__(
+    def loss_on_fixed_topk(
         self,
         indexer: DSAIndexerInputs,
         teacher: DSAIndexerTeacher,
@@ -194,9 +224,11 @@ def torch_fixed_topk_indexer_loss(
     *,
     loss_type: IndexerLossType,
 ) -> DSAIndexerLossStats:
-    """短序列 sparse oracle；生产实现还需要按 query/head chunk。
+    """短序列 fixed-ID sparse oracle。
 
-    这里假定 GLM-5.2 的 batch=1、teacher KV head=1，只为表达数学和安全 mask。
+    第一阶段 query chunk 只属于 no-grad selection；本函数仍保持一次完整调用。
+    loss query/head chunk 是后续独立优化。这里假定 GLM-5.2 的 batch=1、
+    teacher KV head=1，只为表达数学和安全 mask。
     """
 
     if loss_type == "dense":
@@ -245,11 +277,9 @@ def torch_fixed_topk_indexer_loss(
     q_i = indexer.q[0].float()  # [S,H_i,D_i]
     k_i = indexer.k[0][safe_ids].float()  # [S,K,D_i]，不 expand 到 head 维
     index_logits_h = torch.einsum("shd,skd->shk", q_i, k_i)
-    index_logits_h = torch.relu(
-        index_logits_h * (indexer.index_head_dim**-0.5)
-    )
+    index_logits_h = torch.relu(index_logits_h * indexer.qk_scale)
     index_logits = torch.einsum(
-        "shk,sh->sk", index_logits_h, indexer.weights[0].float()
+        "shk,sh->sk", index_logits_h, indexer.head_weights[0]
     )
     index_logits = index_logits.masked_fill(~safe_support, float("-inf"))
     predict_log_probs = torch.log_softmax(index_logits, dim=-1)
@@ -331,7 +361,6 @@ class DSAIndexerLossContext(nn.Module):
         self.global_valid_rows_step: torch.Tensor | None = None
         self.grad_average_group_size = 1
         self.num_contexts = 1
-        self._running_total: torch.Tensor | None = None
 
     @staticmethod
     def build_batches(
@@ -370,12 +399,10 @@ class DSAIndexerLossContext(nn.Module):
             ctx.num_contexts = len(contexts)
         return contexts
 
-    def accumulate(
+    def scale(
         self,
         *,
-        source_layer_idx: int,
         stats: DSAIndexerLossStats,
-        record: bool,
     ) -> torch.Tensor:
         rows_local = stats.valid_rows.to(stats.kl_sum.device, torch.float32)
         expected_rows = self.local_valid_rows.to(rows_local.device, torch.float32)
@@ -402,21 +429,7 @@ class DSAIndexerLossContext(nn.Module):
                 / self.num_contexts
             )
 
-        if record:
-            detached = scaled.detach()
-            self._running_total = (
-                detached.clone()
-                if self._running_total is None
-                else self._running_total + detached
-            )
         return scaled
-
-    def finalize(self, device: torch.device) -> torch.Tensor:
-        total = self._running_total
-        self._running_total = None
-        if total is None:
-            total = torch.tensor(0.0, device=device, dtype=torch.float32)
-        return total
 
 
 class AuxLossScaler(torch.autograd.Function):
@@ -434,34 +447,36 @@ class AuxLossScaler(torch.autograd.Function):
 
 
 class DSAIndexer(nn.Module):
-    """保留现有 forward 兼容层；joint 使用新增的细粒度方法。"""
+    """显式 IDs 输出；joint 使用新增的细粒度方法。"""
 
     def __init__(
         self,
         *,
         train_mode: IndexerTrainMode,
         loss_cfg: DSAIndexerLossConfig | None,
-        topk_op: DSATopKIndicesProtocol,
-        loss_op: DSAIndexerLossProtocol | None,
+        backend: DSAIndexerBackendProtocol,
         index_topk: int,
         index_head_dim: int,
+        index_n_heads: int,
     ) -> None:
         super().__init__()
         validate_indexer_training_config(train_mode, loss_cfg)
         self.train_mode = train_mode
         self.loss_cfg = loss_cfg
-        self.topk_op = topk_op
-        self.loss_op = loss_op
+        self.backend = backend
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
+        self.index_n_heads = index_n_heads
         self.wq_b: nn.Module = ...
         self.wk: nn.Module = ...
         self.k_norm: nn.Module = ...
         self.weights_proj: nn.Module = ...
         self.requires_grad_(train_mode == "joint")
 
-    def forward(self, hidden_states, q_resid, position_embeddings, seq_ctx):
-        """frozen/eval 兼容入口仍返回 Tensor，不引入复合类型。"""
+    def forward(
+        self, hidden_states, q_resid, position_embeddings, seq_ctx
+    ) -> DSAIndexerOutput:
+        """frozen/eval 返回显式 IDs-only TypedDict。"""
 
         if self.train_mode != "frozen" and self.training:
             raise RuntimeError("joint training must use the attention-orchestrated path")
@@ -469,7 +484,8 @@ class DSAIndexer(nn.Module):
             inputs = self.project(
                 hidden_states, q_resid, position_embeddings, seq_ctx
             )
-            return self.select_topk(inputs, seq_ctx)
+            ids = self.select_topk(inputs, seq_ctx)
+        return {"dsa_topk_ids": ids.to(torch.int32).contiguous()}
 
     def project(
         self,
@@ -482,29 +498,28 @@ class DSAIndexer(nn.Module):
         k = project_and_gather_indexer_k(
             self.wk, self.k_norm, hidden_states, position_embeddings, seq_ctx
         )
-        # H_index^-1/2 只在 weights projection 路径乘一次。
-        weights = self.weights_proj(hidden_states).float() * (q.size(2) ** -0.5)
-        return DSAIndexerInputs(q, k, weights, self.index_head_dim)
+        # 公共唯一表示：FP32 head_weights 只含 H_index^-1/2。
+        head_weights = (
+            self.weights_proj(hidden_states).float()
+            * (self.index_n_heads**-0.5)
+        )
+        return DSAIndexerInputs(q, k, head_weights, self.index_head_dim)
 
     @torch.no_grad()
     def select_topk(
         self, inputs: DSAIndexerInputs, seq_ctx: SequenceContext
     ) -> torch.Tensor:
         inputs = inputs.detached()
-        # D_index^-1/2 由现有 Top-K op 内部乘一次；loss backend 必须同口径，不能重复缩放。
-        return self.topk_op(
-            inputs.q,
-            inputs.k,
-            inputs.weights,
+        return self.backend.select_topk(
+            inputs,
             seq_ctx,
-            index_head_dim=self.index_head_dim,
             index_topk=self.index_topk,
         )
 
     def loss_for_indices(self, inputs, teacher, topk_indices, seq_ctx):
-        if self.loss_op is None or self.loss_cfg is None:
+        if self.loss_cfg is None:
             raise RuntimeError("joint Indexer loss backend is missing")
-        return self.loss_op(
+        return self.backend.loss_on_fixed_topk(
             inputs,
             teacher.detached(),
             topk_indices,
@@ -521,127 +536,32 @@ def project_and_gather_indexer_k(
 ): ...
 
 
-class IndexerExecutionPhase(Enum):
-    NORMAL = auto()
-    CHECKPOINT_ORIGINAL = auto()
-    CHECKPOINT_REPLAY = auto()
+def reuse_during_recompute(function, /, *args, **kwargs):
+    """真实实现复用 PR #2039 的 checkpoint-local FIFO helper。"""
+
+    ...
 
 
-@dataclass(frozen=True)
-class DSAIndexerSelection:
-    topk_indices: torch.Tensor
-    loss_stats: DSAIndexerLossStats | None = None
-    attach_loss: bool = False
-    record_loss: bool = False
+class GLM52AttnOutputs(TypedDict):
+    raw_output: torch.Tensor
+    projected_output: torch.Tensor
+    softmax_lse: torch.Tensor
+    dsa_topk_ids: torch.Tensor
+    indexer_loss: NotRequired[torch.Tensor]
 
 
-class CrossLayerTopKSharingRuntime:
-    """伪扩展：真实 seq_ctx.dsa_topk_cache 仍是唯一 cache。
+class GLM52DecoderLayerOutputs(TypedDict):
+    hidden_states: torch.Tensor
+    dsa_topk_ids: torch.Tensor
+    indexer_loss: NotRequired[torch.Tensor]
 
-    DSATopKCacheState 新增 checkpoint_original_sources: set[int]。source 的
-    original 当场写 marker，不能等最后 consumer 再设置一个全局 checkpoint_active；
-    默认 GLM-5.2 的最后 consumer 可能是不 checkpoint 的最后一层。
-    """
 
-    def get_or_compute(self, *, layer, seq_ctx, compute_source_topk):
-        # frozen/eval 完整沿用当前实现，不写新的 marker。
-        return self._existing_get_or_compute(layer, seq_ctx, compute_source_topk)
+class GLM52MicroBatchDecoderOutputs(TypedDict):
+    """P2 list 契约；每个位置拥有独立 IDs/loss context/FIFO entry。"""
 
-    def get_or_compute_for_joint(
-        self, *, layer, seq_ctx, compute_source_topk, phase: IndexerExecutionPhase
-    ):
-        # joint-only wrapper：source original 当场标记；source replay 读取原 IDs。
-        if phase is IndexerExecutionPhase.CHECKPOINT_REPLAY:
-            return self._read_existing_cache(seq_ctx, layer.source_layer_idx)
-        topk = self.get_or_compute(
-            layer=layer,
-            seq_ctx=seq_ctx,
-            compute_source_topk=compute_source_topk,
-        )
-        if (
-            phase is IndexerExecutionPhase.CHECKPOINT_ORIGINAL
-            and layer.layer_idx == layer.source_layer_idx
-        ):
-            seq_ctx.dsa_topk_cache.checkpoint_original_sources.add(layer.source_layer_idx)
-        return topk
-
-    def after_sparse_mla_use(self, *, layer, seq_ctx) -> None:
-        # 仍只由 decoder post-hook 调用。grad-enabled 的普通 shared last-consumer
-        # 不能清掉 marker/cache；更高层 backward 完成后，source replay 按现有
-        # recompute_release plan 释放 residency，并删除该 source marker。
-        if self._is_checkpoint_recompute(layer, seq_ctx):
-            if (
-                layer.dsa_topk_recompute_release.get(layer.source_layer_idx)
-                == layer.layer_idx
-            ):
-                self._release_existing_cache(seq_ctx, layer.source_layer_idx)
-                seq_ctx.dsa_topk_cache.checkpoint_original_sources.discard(
-                    layer.source_layer_idx
-                )
-            return
-        self._existing_after_sparse_mla_use(layer, seq_ctx)
-
-    def execution_phase(self, *, layer, seq_ctx) -> IndexerExecutionPhase:
-        if self._is_checkpoint_original_forward(layer):
-            return IndexerExecutionPhase.CHECKPOINT_ORIGINAL
-        if self._is_checkpoint_recompute(layer, seq_ctx):
-            return IndexerExecutionPhase.CHECKPOINT_REPLAY
-        return IndexerExecutionPhase.NORMAL
-
-    def resolve_with_loss(
-        self,
-        *,
-        layer,
-        seq_ctx,
-        need_loss: bool,
-        select_topk: Callable[[], torch.Tensor],
-        loss_for_indices: Callable[[torch.Tensor], DSAIndexerLossStats],
-    ) -> DSAIndexerSelection:
-        phase = self.execution_phase(layer=layer, seq_ctx=seq_ctx)
-        topk = self.get_or_compute_for_joint(
-            layer=layer,
-            seq_ctx=seq_ctx,
-            compute_source_topk=select_topk,
-            phase=phase,
-        )
-        is_source = layer.source_layer_idx == layer.layer_idx
-        if not need_loss or not is_source:
-            return DSAIndexerSelection(topk)
-
-        if phase is IndexerExecutionPhase.CHECKPOINT_ORIGINAL:
-            with torch.no_grad():
-                stats = loss_for_indices(topk)
-            return DSAIndexerSelection(
-                topk, stats, attach_loss=False, record_loss=True
-            )
-
-        stats = loss_for_indices(topk)
-        return DSAIndexerSelection(
-            topk,
-            stats,
-            attach_loss=True,
-            record_loss=phase is IndexerExecutionPhase.NORMAL,
-        )
-
-    def _is_checkpoint_original_forward(self, layer) -> bool: ...
-
-    def _is_checkpoint_recompute(self, layer, seq_ctx) -> bool:
-        return (
-            layer.layer_idx == layer.source_layer_idx
-            and layer.source_layer_idx
-            in seq_ctx.dsa_topk_cache.checkpoint_original_sources
-            and torch.is_grad_enabled()
-        )
-
-    def _existing_get_or_compute(self, layer, seq_ctx, compute_source_topk): ...
-
-    def _existing_after_sparse_mla_use(self, layer, seq_ctx) -> None: ...
-
-    def _read_existing_cache(self, seq_ctx, source_layer_idx) -> torch.Tensor: ...
-
-    def _release_existing_cache(self, seq_ctx, source_layer_idx) -> None:
-        """复用现有 residency/recompute-release 清理，并同步 released_sources。"""
-        ...
+    hidden_states: list[torch.Tensor]
+    dsa_topk_ids: list[torch.Tensor]
+    indexer_loss: NotRequired[list[torch.Tensor | None]]
 
 
 class DSAMultiLatentAttention(nn.Module):
@@ -656,22 +576,28 @@ class DSAMultiLatentAttention(nn.Module):
         *,
         indexer_train_mode: IndexerTrainMode,
         indexer_loss_cfg: DSAIndexerLossConfig | None,
-        indexer_loss_op: DSAIndexerLossProtocol | None,
+        indexer_backend: DSAIndexerBackendProtocol,
         **kwargs,
     ) -> None:
         super().__init__()
         self.indexer_train_mode = indexer_train_mode
         self.indexer: DSAIndexer | None = ...
-        self.topk_runtime: CrossLayerTopKSharingRuntime = ...
+        self.indexer_backend = indexer_backend
+        # checkpoint frame 若按 callable 分桶，必须保存同一个 bound-method 对象，
+        # 不能在 original/replay 临时重新取属性后依赖 object identity。
+        self._selector_for_recompute = (
+            self.indexer.select_topk if self.indexer is not None else None
+        )
 
     def forward(
         self,
         hidden_states,
         position_embeddings,
         seq_ctx,
+        dsa_topk_ids: torch.Tensor | None = None,
         *,
         indexer_loss_ctx: DSAIndexerLossContext | None = None,
-    ):
+    ) -> GLM52AttnOutputs:
         q_resid, query, key, value_dim = self._project_main_attention(
             hidden_states, position_embeddings, seq_ctx
         )
@@ -679,60 +605,65 @@ class DSAMultiLatentAttention(nn.Module):
         if self.training and self.indexer_train_mode == "joint" and indexer_loss_ctx is None:
             raise RuntimeError("joint Indexer training lost its loss context")
 
-        if indexer_loss_ctx is None:
-            # frozen 和 joint-eval 完整保留当前入口/compile/checkpoint 图形。
-            topk_indices = self.topk_runtime.get_or_compute(
-                layer=self,
-                seq_ctx=seq_ctx,
-                compute_source_topk=lambda: self.indexer(
-                    hidden_states, q_resid, position_embeddings, seq_ctx
-                ),
-            )
-            selection = DSAIndexerSelection(topk_indices)
-        else:
-            inputs: DSAIndexerInputs | None = None
-
-            def get_inputs() -> DSAIndexerInputs:
-                nonlocal inputs
-                assert is_source and self.indexer is not None
-                if inputs is None:
-                    inputs = self.indexer.project(
-                        hidden_states.detach(),
-                        q_resid.detach(),
+        scaled_indexer_loss: torch.Tensor | None = None
+        if is_source:
+            assert self.indexer is not None
+            # source 总是覆盖上一 source 的 IDs。
+            if indexer_loss_ctx is None:
+                with torch.no_grad():
+                    indexer_output = reuse_during_recompute(
+                        self.indexer,
+                        hidden_states,
+                        q_resid,
                         position_embeddings,
                         seq_ctx,
                     )
-                return inputs
-
-            teacher = DSAIndexerTeacher(
-                query.detach(), key.detach(), self.softmax_scale
+                dsa_topk_ids = indexer_output["dsa_topk_ids"]
+            else:
+                # original 在 no_grad 下执行；replay 在 grad 下重新建立这条投影图。
+                inputs = self.indexer.project(
+                    hidden_states.detach(),
+                    q_resid.detach(),
+                    position_embeddings,
+                    seq_ctx,
+                )
+                # 固定 call-site/FIFO：original 真正 select，replay 从 frame 取 IDs。
+                assert self._selector_for_recompute is not None
+                dsa_topk_ids = reuse_during_recompute(
+                    self._selector_for_recompute,
+                    inputs.detached(),
+                    seq_ctx,
+                )
+                teacher = DSAIndexerTeacher(
+                    query.detach(), key.detach(), self.softmax_scale
+                )
+                stats = self.indexer.loss_for_indices(
+                    inputs, teacher, dsa_topk_ids, seq_ctx
+                )
+                scaled_indexer_loss = indexer_loss_ctx.scale(stats=stats)
+        elif dsa_topk_ids is None:
+            raise RuntimeError(
+                f"shared DSA layer {self.layer_idx} requires explicit dsa_topk_ids"
             )
-            selection = self.topk_runtime.resolve_with_loss(
-                layer=self,
-                seq_ctx=seq_ctx,
-                need_loss=True,
-                select_topk=lambda: self.indexer.select_topk(get_inputs(), seq_ctx),
-                loss_for_indices=lambda ids: self.indexer.loss_for_indices(
-                    get_inputs(), teacher, ids, seq_ctx
-                ),
-            )
 
-        sparse_output = self._sparse_mla(query, key, selection.topk_indices, value_dim)
-        # 不在 attention 内调用 after_sparse_mla_use。当前真实实现由 decoder
-        # post-hook 在正确边界调用；重复调用会双减 MTP counter 或提前释放 cache。
+        assert dsa_topk_ids is not None
+        if dsa_topk_ids.dtype != torch.int32 or not dsa_topk_ids.is_contiguous():
+            raise RuntimeError("dsa_topk_ids must be contiguous int32")
+
+        sparse_output = self._sparse_mla(query, key, dsa_topk_ids, value_dim)
         attn_outputs = self._finish_attention(sparse_output)
         projected_output = attn_outputs["projected_output"]
 
-        if selection.loss_stats is not None:
-            assert indexer_loss_ctx is not None
-            scaled = indexer_loss_ctx.accumulate(
-                source_layer_idx=self.source_layer_idx,
-                stats=selection.loss_stats,
-                record=selection.record_loss,
+        # NORMAL 和 replay 为 grad-enabled，会把 KL 挂进主 backward；checkpoint
+        # original 为 no-grad，只返回 detached 展示值。外层 decoder 只聚合 original 输出。
+        if scaled_indexer_loss is not None and torch.is_grad_enabled():
+            projected_output = AuxLossScaler.apply(
+                projected_output, scaled_indexer_loss
             )
-            if selection.attach_loss:
-                projected_output = AuxLossScaler.apply(projected_output, scaled)
         attn_outputs["projected_output"] = projected_output
+        attn_outputs["dsa_topk_ids"] = dsa_topk_ids
+        if scaled_indexer_loss is not None:
+            attn_outputs["indexer_loss"] = scaled_indexer_loss.detach()
         return attn_outputs
 
     def _project_main_attention(self, hidden_states, position_embeddings, seq_ctx): ...
@@ -742,6 +673,63 @@ class DSAMultiLatentAttention(nn.Module):
     def _finish_attention(self, output) -> dict[str, torch.Tensor]:
         # 保留 raw_output / softmax_lse，并完成 absorbed w_vc 与 o_proj。
         ...
+
+
+def call_glm52_decoder_layer(
+    layer,
+    hidden_states,
+    *,
+    dsa_topk_ids: torch.Tensor | None,
+    indexer_loss_ctx: DSAIndexerLossContext | None,
+):
+    """checkpoint wrapper 外聚合 original 输出；replay 不再次经过这里。
+
+    为突出 IDs/loss 契约省略 position_embeddings/seq_ctx 等既有参数，真实调用必须原样透传。
+    """
+
+    layer_output: GLM52DecoderLayerOutputs = layer(
+        hidden_states,
+        dsa_topk_ids=dsa_topk_ids,
+        indexer_loss_ctx=indexer_loss_ctx,
+    )
+    return (
+        layer_output["hidden_states"],
+        layer_output["dsa_topk_ids"],
+        layer_output.get("indexer_loss"),
+    )
+
+
+def call_glm52_decoder_layer_micro_batches(
+    layer,
+    hidden_states: list[torch.Tensor],
+    *,
+    dsa_topk_ids: list[torch.Tensor | None],
+    indexer_loss_ctx: list[DSAIndexerLossContext | None],
+) -> GLM52MicroBatchDecoderOutputs:
+    """P2 目标契约；一次 layer invocation 共享 frame，MB 按序使用独立 FIFO entry。
+
+    为突出 list 契约省略 position_embeddings/seq_ctx 等既有参数，真实调用必须原样透传。
+    """
+
+    if not (
+        len(hidden_states) == len(dsa_topk_ids) == len(indexer_loss_ctx)
+    ):
+        raise RuntimeError("micro-batch hidden/IDs/loss-context lists must align")
+    # 必须调用 checkpoint wrapper 的 public layer boundary；layer.forward 再在 wrapper
+    # 内部分派到 _micro_batch_forward。不能直调私有方法，也不能把每个 MB 拆成多个
+    # checkpoint invocation。frame 内按 list 顺序保存/恢复 IDs。
+    output: GLM52MicroBatchDecoderOutputs = layer(
+        hidden_states,
+        dsa_topk_ids=dsa_topk_ids,
+        indexer_loss_ctx=indexer_loss_ctx,
+    )
+    if not (
+        len(output["hidden_states"])
+        == len(output["dsa_topk_ids"])
+        == len(hidden_states)
+    ):
+        raise RuntimeError("micro-batch output lists must preserve input cardinality")
+    return output
 
 
 class MoELossContextDict(TypedDict):
@@ -809,26 +797,202 @@ def indexer_collective_device(
 def finalize_indexer_output(
     *,
     output: dict[str, Any],
-    loss_ctx: MoELossContextDict | list[MoELossContextDict],
+    layer_indexer_losses: list[torch.Tensor | None],
     device: torch.device,
 ) -> None:
-    """single-MB 与 intra-layer multi-MB 都归约成一个 detached 字段。"""
+    """wrapper 外汇总 original layer outputs；replay 不调用本函数。"""
 
-    loss_ctx_list = loss_ctx if isinstance(loss_ctx, list) else [loss_ctx]
-    indexer_contexts = [
-        ctx["indexer"]
-        for ctx in loss_ctx_list
-        if ctx.get("indexer") is not None
-    ]
-    if not indexer_contexts:
+    values = [value.detach() for value in layer_indexer_losses if value is not None]
+    if not values:
         return
-    values = [ctx.finalize(device) for ctx in indexer_contexts]
-    output["indexer_loss"] = torch.stack(values).sum().detach()
+    output["indexer_loss"] = torch.stack(
+        [value.to(device) for value in values]
+    ).sum()
+
+
+class _TopKSelector(Protocol):
+    """facade 内部 SPI；不向 model/attention 暴露。"""
+
+    def __call__(
+        self,
+        indexer: DSAIndexerInputs,
+        seq_ctx: SequenceContext,
+        *,
+        index_topk: int,
+    ) -> torch.Tensor: ...
+
+
+class _FixedIDLossOp(Protocol):
+    def __call__(
+        self,
+        indexer: DSAIndexerInputs,
+        teacher: DSAIndexerTeacher,
+        topk_indices: torch.Tensor,
+        seq_ctx: SequenceContext,
+        *,
+        loss_type: IndexerLossType,
+    ) -> DSAIndexerLossStats: ...
+
+
+class ComposedDSAIndexerBackend:
+    """统一 facade；selection/loss adapter 的 dtype/layout 差异留在内部。"""
+
+    def __init__(
+        self,
+        selector: _TopKSelector,
+        loss_op: _FixedIDLossOp | None,
+    ) -> None:
+        self.selector = selector
+        self.loss_op = loss_op
+
+    def select_topk(self, indexer, seq_ctx, *, index_topk):
+        return self.selector(indexer, seq_ctx, index_topk=index_topk)
+
+    def loss_on_fixed_topk(
+        self, indexer, teacher, topk_indices, seq_ctx, *, loss_type
+    ):
+        if self.loss_op is None:
+            raise RuntimeError("frozen Indexer backend has no loss adapter")
+        return self.loss_op(
+            indexer,
+            teacher,
+            topk_indices,
+            seq_ctx,
+            loss_type=loss_type,
+        )
+
+
+class TileLangTopKSelector:
+    """第一阶段只 chunk no-grad selection，不 chunk fixed-ID loss/backward。"""
+
+    def __init__(self, query_chunk_size: int | None) -> None:
+        self.query_chunk_size = query_chunk_size
+
+    @torch.no_grad()
+    def __call__(self, indexer, seq_ctx, *, index_topk):
+        return tilelang_topk_query_chunked(
+            indexer,
+            seq_ctx,
+            index_topk=index_topk,
+            query_chunk_size=self.query_chunk_size,
+        )
+
+
+@torch.no_grad()
+def tilelang_topk_query_chunked(
+    indexer: DSAIndexerInputs,
+    seq_ctx: SequenceContext,
+    *,
+    index_topk: int,
+    query_chunk_size: int | None,
+) -> torch.Tensor:
+    """沿 Q 分块；每块使用完整 global K，只拼 int32 IDs。"""
+
+    if indexer.q.size(0) != 1 or indexer.k.size(0) != 1:
+        raise NotImplementedError("GLM packed Top-K selector assumes batch=1")
+    q = indexer.q[0].contiguous()
+    k = indexer.k[0].contiguous()
+    # TileLang primitive 没有独立 sm_scale 参数，在 adapter 边界折入 D^-1/2。
+    effective_weights = indexer.effective_weights(torch.float32)[0].contiguous()
+
+    # 必须基于完整 Q 生成一次 global K ranges；不能在每个 chunk 从位置 0 重建。
+    starts, ends = seq_ctx.packed_causal_query_ranges(q.size(0), q.device)
+    if query_chunk_size is None:
+        # None 严格保留现有 one-shot baseline。
+        return _tilelang_topk_from_ranges(
+            q, k, effective_weights, starts, ends, index_topk
+        )
+
+    chunks: list[torch.Tensor] = []
+    for lo in range(0, q.size(0), query_chunk_size):
+        hi = min(lo + query_chunk_size, q.size(0))
+        q_chunk, weights_chunk, starts_chunk, ends_chunk, valid_rows = (
+            _pad_tilelang_query_chunk(
+                q[lo:hi],
+                effective_weights[lo:hi],
+                starts[lo:hi],
+                ends[lo:hi],
+            )
+        )
+        # 低层 op 内部完成 logits -> topk；dense logits/topk scores 不跨块返回。
+        ids = _tilelang_topk_from_ranges(
+            q_chunk,
+            k,
+            weights_chunk,
+            starts_chunk,
+            ends_chunk,
+            index_topk,
+        )
+        chunks.append(ids[:valid_rows])
+    return torch.cat(chunks, dim=0).to(torch.int32).contiguous()
+
+
+def _pad_tilelang_query_chunk(q, weights, starts, ends):
+    """Pad 到 primitive 的 block_Q 倍数；padding row 使用空 global range。
+
+    当前 kernel 没有完整 q-tail guard。真实实现也可选择先移植 MCore guard；在其中
+    任一方案落地前，不能直接把非对齐 chunk 送入 primitive。
+    """
+
+    block_q = 128 // q.size(1)
+    valid_rows = q.size(0)
+    padded_rows = round_up(valid_rows, block_q)
+    return pad_q_and_weights_with_zero_and_empty_ranges(
+        q, weights, starts, ends, padded_rows
+    ) + (valid_rows,)
+
+
+def round_up(value: int, multiple: int) -> int: ...
+
+
+def pad_q_and_weights_with_zero_and_empty_ranges(*args): ...
+
+
+def _tilelang_topk_from_ranges(q, k, weights, starts, ends, index_topk):
+    """现有 one-shot primitive 的 IDs-only adapter；不返回 logits/scores。"""
+
+    ...
+
+
+def build_indexer_backend(
+    *,
+    selection_backend: Literal["torch", "tilelang", "cudnn_dsa"],
+    query_chunk_size: int | None,
+    loss_cfg: DSAIndexerLossConfig | None,
+) -> DSAIndexerBackendProtocol:
+    if selection_backend == "torch":
+        if query_chunk_size is not None:
+            raise RuntimeError("P0 torch selector does not support query chunk")
+        selector = torch_topk_selector_adapter
+    elif selection_backend in {"tilelang", "cudnn_dsa"}:
+        # current cudnn_dsa 的 Top-K 仍走 TileLang。
+        selector = TileLangTopKSelector(query_chunk_size)
+    else:
+        raise AssertionError(selection_backend)
+
+    loss_op = build_indexer_loss_backend(loss_cfg) if loss_cfg is not None else None
+    return ComposedDSAIndexerBackend(selector, loss_op)
+
+
+def torch_topk_selector_adapter(indexer, seq_ctx, *, index_topk):
+    # Torch selector 接收同一 canonical head_weights + qk_scale，不能再按 head_dim
+    # 隐式重复缩放。
+    return torch_topk_selector_impl(
+        indexer.q,
+        indexer.k,
+        indexer.head_weights,
+        seq_ctx,
+        qk_scale=indexer.qk_scale,
+        index_topk=index_topk,
+    )
+
+
+def torch_topk_selector_impl(*args, **kwargs) -> torch.Tensor: ...
 
 
 def build_indexer_loss_backend(
     config: DSAIndexerLossConfig,
-) -> DSAIndexerLossProtocol:
+) -> _FixedIDLossOp:
     """静态 resolver；动态 shape/workspace 由 op 调用时继续 guard。"""
 
     if config.backend == "torch_reference":
@@ -861,7 +1025,25 @@ def ensure_full_cudnn_indexer_loss_available() -> None: ...
 def tilelang_fixed_topk_indexer_loss(*args, **kwargs) -> DSAIndexerLossStats: ...
 
 
-def cudnn_fixed_topk_indexer_loss(*args, **kwargs) -> DSAIndexerLossStats: ...
+def cudnn_fixed_topk_indexer_loss(
+    indexer, teacher, topk_indices, seq_ctx, *, loss_type
+) -> DSAIndexerLossStats:
+    # cuDNN adapter 使用 sm_scale=1，因此只在边界临时折入 D^-1/2；梯度仍会
+    # 经 cast/乘法回到 canonical head_weights 和 weights_proj。
+    effective_weights = indexer.effective_weights(torch.bfloat16)
+    return cudnn_indexer_loss_impl(
+        indexer.q,
+        indexer.k,
+        effective_weights,
+        teacher,
+        topk_indices,
+        seq_ctx,
+        sm_scale=1.0,
+        loss_type=loss_type,
+    )
+
+
+def cudnn_indexer_loss_impl(*args, **kwargs) -> DSAIndexerLossStats: ...
 
 
 def validate_trainer_combination(model_cfg, optim_cfg, fsdp_cfg) -> None:
@@ -885,15 +1067,69 @@ def validate_trainer_combination(model_cfg, optim_cfg, fsdp_cfg) -> None:
 
 
 class IndexerCheckpointMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
     mode: IndexerTrainMode
     loss_type: IndexerLossType | None
     loss_coeff: float | None
     loss_backend: IndexerLossBackend | None
+    global_average: bool | None
+    # 同时记录主 SparseMLA backend 与解析后的 selector；cudnn_dsa 当前 selector=tilelang。
+    sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa"]
+    resolved_selector_backend: Literal["torch", "tilelang"]
+    index_topk: int
+    indexer_topk_query_chunk_size: int | None
+    # frozen 仍兼容主模型 Muon；只有 joint P1 validator 强制 all_adamw。
+    optimizer_family: Literal["adamw", "muon"]
+    indexer_optimizer_policy: Literal["not_applicable", "all_adamw"]
     hf_base: str
     converted_from_mtp_hf_base: str | None = None
     source_num_nextn_predict_layers: int | None = None
     # 保存解析后的物理 source/full 层，兼容 indexer_types=None 的 freq/offset 配置。
     effective_source_layers: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        loss_fields = (
+            self.loss_type,
+            self.loss_coeff,
+            self.loss_backend,
+            self.global_average,
+        )
+        if self.mode == "frozen":
+            if any(value is not None for value in loss_fields):
+                raise ValueError("frozen metadata must not contain Indexer loss policy")
+            if self.indexer_optimizer_policy != "not_applicable":
+                raise ValueError("frozen Indexer optimizer policy must be not_applicable")
+        else:
+            if any(value is None for value in loss_fields):
+                raise ValueError("joint metadata requires complete Indexer loss policy")
+            if (
+                self.optimizer_family != "adamw"
+                or self.indexer_optimizer_policy != "all_adamw"
+            ):
+                raise ValueError("P1 joint metadata requires all-AdamW policy")
+        if self.index_topk <= 0:
+            raise ValueError("index_topk must be positive")
+        if (
+            self.indexer_topk_query_chunk_size is not None
+            and self.indexer_topk_query_chunk_size <= 0
+        ):
+            raise ValueError("query chunk size must be positive")
+        expected_selector = (
+            "torch" if self.sparse_mla_backend == "torch" else "tilelang"
+        )
+        if self.resolved_selector_backend != expected_selector:
+            raise ValueError(
+                "resolved selector disagrees with current SparseMLA backend mapping"
+            )
+        if (
+            self.indexer_topk_query_chunk_size is not None
+            and self.resolved_selector_backend != "tilelang"
+        ):
+            raise ValueError("query chunk requires a TileLang selector")
+        return self
 
 
 def save_indexer_metadata(checkpoint_root: Path, metadata: IndexerCheckpointMetadata):
@@ -940,7 +1176,10 @@ def require_hf_base_available(hf_base: str) -> None: ...
 
 
 def configure_glm52_joint_sft(
-    model_cfg, *, loss_backend: str = "torch_reference"
+    model_cfg,
+    *,
+    loss_backend: str = "torch_reference",
+    indexer_topk_query_chunk_size: int | None = None,
 ) -> None:
     if model_cfg.mtp_config is not None or bool(model_cfg.num_nextn_predict_layers):
         raise RuntimeError(
@@ -951,6 +1190,9 @@ def configure_glm52_joint_sft(
         )
     model_cfg.compile_cfg = False
     model_cfg.attention.indexer_train_mode = "joint"
+    model_cfg.attention.indexer_topk_query_chunk_size = (
+        indexer_topk_query_chunk_size
+    )
     model_cfg.attention.indexer_loss_cfg = DSAIndexerLossConfig(
         loss_coeff=1e-3,
         loss_type="sparse",
